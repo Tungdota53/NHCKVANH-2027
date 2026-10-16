@@ -1,0 +1,2 @@
+# Preserve exact source bytes, including historical line endings, for protocol hashes.
+* -text

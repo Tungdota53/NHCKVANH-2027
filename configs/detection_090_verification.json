@@ -1,0 +1,5 @@
+[
+  {"model":"weights/yolo11n.pt","imgsz":160,"batch":4,"accumulation":4,"freeze":0,"lr0":0.001},
+  {"model":"weights/yolo11n.pt","imgsz":160,"batch":4,"accumulation":4,"freeze":5,"lr0":0.001},
+  {"model":"weights/yolo11s.pt","imgsz":160,"batch":4,"accumulation":4,"freeze":0,"lr0":0.001}
+]

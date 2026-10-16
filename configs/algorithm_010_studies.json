@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "studies": [
+    {"path": "../runs/algorithm_010_mnist_operational/20261016_151018_583510"},
+    {"path": "../runs/algorithm_010_cifar_gpu/20261016_154627_339104"}
+  ],
+  "required_methods": ["adaptive_full", "random"],
+  "bootstrap_seed": 2027,
+  "bootstrap_samples": 2000,
+  "confidence": 0.95
+}

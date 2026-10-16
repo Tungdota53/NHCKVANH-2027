@@ -1,0 +1,1 @@
+dataset_id,model,precision,optimizer,gpu,runtime_protocol,imgsz,batch,freeze,nbs,lr0,train_images,val_images,classes,objects_per_image,small_object_ratio,full_epochs,final_map50_95,peak_reserved_mb,full_training_seconds

@@ -1,0 +1,37 @@
+.venv/
+.venv-cpu/
+.venv-v2-*/
+.venv*/
+.train-config-runtime.json
+.train-config-runtime.json.tmp
+build/
+dist/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local experiment outputs, downloaded datasets and model weights.
+runs/
+Ultralytics/
+ViECAP-Image-Captioning-Vietnamese-master/
+weights/
+data/
+datasets/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+*.cache
+*.log
+
+# Credentials and machine-local settings must never be published.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json

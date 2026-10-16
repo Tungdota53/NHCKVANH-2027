@@ -1,0 +1,8 @@
+[
+  {"model": "weights/yolo11n.pt", "imgsz": 160, "batch": 4, "accumulation": 4, "lr0": 0.001},
+  {"model": "weights/yolo11n.pt", "imgsz": 224, "batch": 4, "accumulation": 4, "lr0": 0.001},
+  {"model": "weights/yolo11n.pt", "imgsz": 160, "batch": 8, "accumulation": 2, "lr0": 0.001},
+  {"model": "weights/yolo11n.pt", "imgsz": 160, "batch": 4, "accumulation": 4, "lr0": 0.0003},
+  {"model": "weights/yolo11s.pt", "imgsz": 160, "batch": 4, "accumulation": 4, "lr0": 0.001},
+  {"model": "weights/yolo11n.pt", "imgsz": 160, "batch": 4, "accumulation": 4, "lr0": 0.001, "weight_decay": 0.001}
+]

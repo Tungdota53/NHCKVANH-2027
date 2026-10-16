@@ -1,0 +1,5 @@
+{
+  "fit": ["runs/benchmark_v2_fashion/20261013_102239_404492/reference_after_controller_fix/20261013_104126_958950"],
+  "calibration": ["runs/calibration_v2_cifar/20261013_113609_587025"],
+  "evaluation": ["runs/evaluation_v2_mnist/20261013_114036_315958"]
+}

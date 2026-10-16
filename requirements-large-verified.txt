@@ -1,0 +1,3 @@
+# Wheel SHA256 values retrieved from official pypi.org metadata, CPython 3.12 Windows.
+scipy==1.18.1 --hash=sha256:5e4d44984abc0020154ea81b247adeddcc3ac5527b975ff798bd1ba0adc513c2
+polars-runtime-32==2.0.0 --hash=sha256:7da1caf3c7b4f397fb213c984013a0c755557619a2d511899a1ff74392484078

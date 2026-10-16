@@ -1,0 +1,8 @@
+[
+  {"width": 16, "imgsz": 32, "batch": 16, "accumulation": 2, "lr0": 0.001},
+  {"width": 16, "imgsz": 32, "batch": 16, "accumulation": 2, "lr0": 0.003},
+  {"width": 32, "imgsz": 32, "batch": 16, "accumulation": 2, "lr0": 0.001},
+  {"width": 64, "imgsz": 32, "batch": 16, "accumulation": 2, "lr0": 0.001},
+  {"width": 16, "imgsz": 64, "batch": 16, "accumulation": 2, "lr0": 0.001},
+  {"width": 16, "imgsz": 32, "batch": 32, "accumulation": 1, "lr0": 0.001}
+]

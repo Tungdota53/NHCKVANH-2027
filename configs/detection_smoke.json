@@ -1,0 +1,4 @@
+[
+  {"model": "yolo11n.yaml", "imgsz": 160, "batch": 4, "accumulation": 4, "lr0": 0.001},
+  {"model": "yolo11n.yaml", "imgsz": 160, "batch": 4, "accumulation": 4, "lr0": 0.0003}
+]
