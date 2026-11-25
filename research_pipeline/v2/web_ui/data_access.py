@@ -1,5 +1,6 @@
 """Read-only data access, telemetry, audit/export wrappers, and safe job launcher."""
 
+from collections import deque
 import json
 import math
 import os
@@ -21,10 +22,57 @@ from .security import resolve_contained_path, resolve_dataset_input
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 _STATIC_TORCH_INFO = None
 _STATIC_TORCH_LOCK = threading.Lock()
 _JOBS_LOCK = threading.Lock()
 _JOBS = {}
+
+
+def _clean_log_lines(raw_text: str, max_lines: int = 120) -> list[str]:
+    cleaned = []
+    normalized = (raw_text or "").replace("\r\n", "\n")
+    for raw_line in normalized.split("\n"):
+        seg = raw_line
+        if "\r" in seg:
+            parts = [p for p in seg.split("\r") if p.strip()]
+            seg = parts[-1] if parts else ""
+        seg = _CTRL_RE.sub("", _ANSI_RE.sub("", seg)).rstrip()
+        if seg.strip():
+            cleaned.append(seg)
+    return cleaned[-max_lines:]
+
+
+def _approx_train_images(ds_path: str, kind: str) -> int | None:
+    try:
+        p = Path(ds_path)
+        candidates = []
+        if kind == "detection/yaml":
+            root = p.parent
+            candidates = [root / "images" / "train", root / "train" / "images", root / "train"]
+        elif p.is_dir():
+            candidates = [p / "images" / "train", p / "train"]
+        for cdir in candidates:
+            if not cdir.is_dir():
+                continue
+            count = 0
+            with os.scandir(cdir) as it:
+                for ent in it:
+                    if ent.is_file() and Path(ent.name).suffix.lower() in _IMG_EXTS:
+                        count += 1
+                    elif ent.is_dir():
+                        with os.scandir(ent.path) as sub:
+                            for sub_ent in sub:
+                                if sub_ent.is_file() and Path(sub_ent.name).suffix.lower() in _IMG_EXTS:
+                                    count += 1
+                    if count >= 50000:
+                        return count
+            if count > 0:
+                return count
+    except OSError:
+        return None
+    return None
 
 
 def _read_json(path: Path, *, optional: bool = True):
@@ -408,6 +456,8 @@ def _snapshot_jobs():
             proc = job.get("process")
             rc = proc.poll() if proc is not None else job.get("returncode")
             job["returncode"] = rc
+            buf = job.get("tail_lines")
+            tail_output = list(buf)[-10:] if buf else []
             items.append({
                 "job_id": jid,
                 "mode": job["mode"],
@@ -417,6 +467,7 @@ def _snapshot_jobs():
                 "output": job.get("output"),
                 "cli_preview": job.get("cli_preview"),
                 "started_at": job.get("started_at"),
+                "tail_output": tail_output,
             })
         items.sort(key=lambda x: x["started_at"] or 0.0, reverse=True)
         return items
@@ -432,10 +483,13 @@ def load_live_status(runs_root, rel_path: str | None = None):
     protocol = _read_json(run_dir / "protocol.json") or {}
     status = _read_json(run_dir / "status.json") or {}
     state = _read_json(run_dir / "state.json") or {}
+    report = _read_json(run_dir / "report.json") or {}
+    dec = report.get("decision") or {}
 
     live_workers = []
     latest_trial = None
     latest_log_lines = []
+    latest_log_attempt = None
     trials_dir = run_dir / "trials"
     if trials_dir.is_dir():
         attempt_dirs = sorted((p for p in trials_dir.iterdir() if p.is_dir()), reverse=True)
@@ -455,13 +509,16 @@ def load_live_status(runs_root, rel_path: str | None = None):
                     "memory_mb": res.get("memory_mb") or res.get("peak_reserved_mb") or res.get("peak_rss_mb"),
                     "status": prec.get("status") or res.get("status"),
                 }
+            if not latest_log_lines:
                 log_path = tdir / "worker.log"
                 if log_path.is_file():
                     try:
-                        raw_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-120:]
-                        latest_log_lines = [_ANSI_RE.sub("", ln) for ln in raw_lines]
+                        cleaned = _clean_log_lines(log_path.read_bytes().decode("utf-8", errors="replace"), max_lines=120)
+                        if cleaned:
+                            latest_log_lines = cleaned
+                            latest_log_attempt = tdir.name
                     except OSError:
-                        latest_log_lines = []
+                        pass
             if prec.get("status") == "running" and prec.get("pid"):
                 try:
                     proc = psutil.Process(int(prec["pid"]))
@@ -493,18 +550,29 @@ def load_live_status(runs_root, rel_path: str | None = None):
     candidates_summary = []
     configs = protocol.get("configs") or []
     results = state.get("results") or {}
+    timeout_count = 0
+    completed_candidates = 0
+    report_cands = {c.get("index"): c for c in (report.get("candidates") or []) if isinstance(c, dict)}
     for idx, cfg in enumerate(configs):
         runs_for_idx = results.get(str(idx), [])
         best_q = None
         last_status = "pending"
         last_curve = []
         for r in runs_for_idx:
-            last_status = r.get("status", last_status)
+            st = r.get("status", last_status)
+            last_status = st
+            if st == "timeout":
+                timeout_count += 1
             q = r.get("quality")
             if isinstance(q, (int, float)) and math.isfinite(q):
                 best_q = q if best_q is None else max(best_q, q)
             if r.get("learning_curve"):
                 last_curve = r["learning_curve"]
+        rc = report_cands.get(idx)
+        if rc and rc.get("complete"):
+            completed_candidates += 1
+        elif not rc and last_status == "ok":
+            completed_candidates += 1
         candidates_summary.append({
             "index": idx,
             "model": Path(str(cfg.get("model", "?"))).name,
@@ -520,6 +588,8 @@ def load_live_status(runs_root, rel_path: str | None = None):
     payload["run"] = {
         "rel_path": rel_path,
         "phase": status.get("phase"),
+        "verification_status": dec.get("verification_status") or status.get("verification_status"),
+        "selected_config_id": dec.get("selected_config_id") or status.get("selected_config_id"),
         "task": protocol.get("task"),
         "method": protocol.get("method"),
         "budget_seconds": budget_s,
@@ -528,6 +598,10 @@ def load_live_status(runs_root, rel_path: str | None = None):
         "live_workers": live_workers,
         "latest_trial": latest_trial,
         "worker_log": latest_log_lines,
+        "worker_log_attempt": latest_log_attempt,
+        "timeout_count": timeout_count,
+        "completed_candidates": completed_candidates,
+        "total_candidates": len(configs),
         "candidates": candidates_summary,
     }
     return payload
@@ -548,6 +622,9 @@ def load_benchmark_detail(runs_root, rel_path: str):
 def list_workspace_resources():
     from ..wizard import scan_datasets, scan_weights
     datasets = scan_datasets(REPO_ROOT / "runs" / "datasets")
+    for ds in datasets:
+        if isinstance(ds, dict) and ds.get("path"):
+            ds["approx_train_images"] = _approx_train_images(ds["path"], ds.get("kind", ""))
     weights = scan_weights(REPO_ROOT / "weights")
     configs_dir = REPO_ROOT / "configs"
     configs = []
@@ -941,9 +1018,27 @@ def launch_job_action(runs_root, payload: dict):
     proc = subprocess.Popen(
         cmd,
         cwd=str(REPO_ROOT),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
+    tail_buf: deque[str] = deque(maxlen=60)
+    if getattr(proc, "stdout", None) is not None:
+        def _drain_stdout(pipe, buf):
+            try:
+                for raw in pipe:
+                    for cln in _clean_log_lines(raw, max_lines=4):
+                        buf.append(cln)
+            except Exception:
+                pass
+            finally:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+        threading.Thread(target=_drain_stdout, args=(proc.stdout, tail_buf), daemon=True).start()
     job_id = uuid.uuid4().hex[:12]
     with _JOBS_LOCK:
         _JOBS[job_id] = {
@@ -955,6 +1050,7 @@ def launch_job_action(runs_root, payload: dict):
             "output": str(out_dir),
             "cli_preview": preview,
             "started_at": time.time(),
+            "tail_lines": tail_buf,
         }
     return {
         "launched": True,

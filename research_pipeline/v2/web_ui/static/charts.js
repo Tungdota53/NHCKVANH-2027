@@ -33,13 +33,14 @@
     el.innerHTML = `<div class="subtitle" style="padding:1.25rem;text-align:center;">${esc(msg)}</div>`;
   }
 
-  function axisFrame(w, h, pad, xMin, xMax, yMin, yMax, xLabel, yLabel) {
+  function axisFrame(w, h, pad, xMin, xMax, yMin, yMax, xLabel, yLabel, opts) {
     const plotW = w - pad.left - pad.right;
     const plotH = h - pad.top - pad.bottom;
     const xSpan = Math.max(1e-9, xMax - xMin);
     const ySpan = Math.max(1e-9, yMax - yMin);
     const sx = (x) => pad.left + ((x - xMin) / xSpan) * plotW;
     const sy = (y) => pad.top + plotH - ((y - yMin) / ySpan) * plotH;
+    const hideXTicks = Boolean(opts && opts.hideXTicks);
 
     let g = `<rect x="${pad.left}" y="${pad.top}" width="${plotW}" height="${plotH}" fill="none" stroke="var(--border)" stroke-width="1"/>`;
     for (let i = 0; i <= 4; i++) {
@@ -48,9 +49,11 @@
       const gy = pad.top + f * plotH;
       const xv = xMin + f * xSpan;
       const yv = yMax - f * ySpan;
-      g += `<line x1="${gx.toFixed(1)}" y1="${pad.top}" x2="${gx.toFixed(1)}" y2="${pad.top + plotH}" stroke="var(--border)" stroke-opacity="0.35" stroke-dasharray="3,3"/>`;
+      if (!hideXTicks) {
+        g += `<line x1="${gx.toFixed(1)}" y1="${pad.top}" x2="${gx.toFixed(1)}" y2="${pad.top + plotH}" stroke="var(--border)" stroke-opacity="0.35" stroke-dasharray="3,3"/>`;
+        g += `<text x="${gx.toFixed(1)}" y="${h - pad.bottom + 16}" text-anchor="middle" font-size="11" fill="var(--text-muted)">${xv.toFixed(xv >= 100 ? 0 : 2)}</text>`;
+      }
       g += `<line x1="${pad.left}" y1="${gy.toFixed(1)}" x2="${pad.left + plotW}" y2="${gy.toFixed(1)}" stroke="var(--border)" stroke-opacity="0.35" stroke-dasharray="3,3"/>`;
-      g += `<text x="${gx.toFixed(1)}" y="${h - pad.bottom + 16}" text-anchor="middle" font-size="11" fill="var(--text-muted)">${xv.toFixed(xv >= 100 ? 0 : 2)}</text>`;
       g += `<text x="${pad.left - 8}" y="${(gy + 4).toFixed(1)}" text-anchor="end" font-size="11" fill="var(--text-muted)">${yv.toFixed(yv >= 100 ? 0 : 2)}</text>`;
     }
     g += `<text x="${pad.left + plotW / 2}" y="${h - 6}" text-anchor="middle" font-size="12" font-weight="600" fill="var(--text)">${esc(xLabel)}</text>`;
@@ -319,7 +322,7 @@
     const pad = { top: 24, right: 24, bottom: 52, left: 60 };
     const finiteVals = rows.map((r) => (r ? r.conditional_regret_mean : null)).filter(finite);
     const yMax = Math.max(0.05, ...finiteVals) * 1.15;
-    const { g, plotW, plotH, sy } = axisFrame(w, h, pad, 0, rows.length, 0, yMax, "Thuật toán", "TB Objective Regret (thấp hơn là tốt hơn)");
+    const { g, plotW, plotH, sy } = axisFrame(w, h, pad, 0, rows.length, 0, yMax, "Thuật toán", "TB Objective Regret (thấp hơn là tốt hơn)", { hideXTicks: true });
     let inner = g;
     const slot = plotW / rows.length;
     const bw = Math.max(18, Math.min(54, slot * 0.5));

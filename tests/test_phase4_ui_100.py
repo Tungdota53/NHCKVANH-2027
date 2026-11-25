@@ -792,6 +792,57 @@ class Phase4WebUITests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_live_status_fallback_log_cleaning_and_benchmark_xtick_suppression(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs_dir = Path(td) / "runs"
+            run_dir = _make_synthetic_run(runs_dir, "timeout_run", with_eval=False)
+            # Newer attempt has an empty worker.log; older attempt has ANSI + \r progress lines.
+            a1 = run_dir / "trials" / "attempt_00001"
+            a2 = run_dir / "trials" / "attempt_00002"
+            a1.mkdir(parents=True, exist_ok=True)
+            a2.mkdir(parents=True, exist_ok=True)
+            (a1 / "worker.log").write_bytes(
+                b"\x1b[34mStarting epoch 1\x1b[0m\n10%\r25%\r100% done\n"
+            )
+            (a2 / "worker.log").write_text("", encoding="utf-8")
+
+            live = data_access.load_live_status(runs_dir, "timeout_run")
+            r = live["run"]
+            self.assertEqual(r["worker_log_attempt"], "attempt_00001")
+            self.assertEqual(r["worker_log"], ["Starting epoch 1", "100% done"])
+            self.assertEqual(r["verification_status"], "empirical_optimal_in_declared_space")
+            self.assertEqual(r["total_candidates"], 2)
+
+            import shutil
+            charts_path = REPO_ROOT / "research_pipeline" / "v2" / "web_ui" / "static" / "charts.js"
+            node_bin = shutil.which("node")
+            if node_bin:
+                script = """
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { window: {} };
+vm.runInNewContext(code, sandbox);
+const el = { innerHTML: "" };
+sandbox.window.NCKHCharts.renderBenchmarkChart(el, [
+  { method: "adaptive_full", conditional_regret_mean: 0.01 },
+  { method: "random", conditional_regret_mean: 0.05 },
+]);
+process.stdout.write(el.innerHTML);
+"""
+                proc = subprocess.run(
+                    [node_bin, "-e", script, str(charts_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=True,
+                )
+                svg = proc.stdout
+                self.assertIn("adaptive_full", svg)
+                self.assertIn("random", svg)
+                self.assertNotIn(">1.50</text>", svg)
+                self.assertNotIn(">2.00</text>", svg)
+
 
 if __name__ == "__main__":
     unittest.main()

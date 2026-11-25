@@ -72,29 +72,51 @@
     return null;
   }
 
+  function baseName(p) {
+    if (!p) return "—";
+    const s = String(p).split(/[\\/]/);
+    return s[s.length - 1] || String(p);
+  }
+
   function badgeClass(status) {
     const s = String(status || "").toLowerCase();
-    if (s.includes("optimal") || s === "complete" || s === "confirmed_feasible" || s === "ok") return "badge-success";
-    if (s.includes("best") || s === "search" || s === "prepared") return "badge-info";
-    if (s.includes("no_verified") || s.includes("partial") || s.includes("interrupted")) return "badge-warn";
-    if (s.includes("fail") || s.includes("oom") || s.includes("contended") || s.includes("infeasible")) return "badge-danger";
+    if (s.includes("no_verified") || s.includes("timeout") || s.includes("partial") || s.includes("interrupted") || s === "unresolved" || s.includes("modified_protocol")) {
+      return "badge-warn";
+    }
+    if (s.includes("fail") || s.includes("oom") || s.includes("contended") || s.includes("infeasible") || s === "error") {
+      return "badge-danger";
+    }
+    if (s.includes("optimal") || s === "complete" || s === "confirmed_feasible" || s === "ok") {
+      return "badge-success";
+    }
+    if (s.includes("best") || s.includes("fully_trained") || s === "search" || s === "prepared" || s === "running") {
+      return "badge-info";
+    }
     return "badge-muted";
   }
 
   function statusLabel(status) {
     const raw = String(status || "");
     const s = raw.toLowerCase();
-    if (s === "empirical_optimal") return "TỐI ƯU THỰC NGHIỆM";
-    if (s === "observed_best") return "TỐT NHẤT QUAN SÁT";
-    if (s === "confirmed_feasible") return "ĐẠT KHẢ THI ĐẦY ĐỦ";
-    if (s === "complete") return "HOÀN TẤT";
-    if (s === "search") return "ĐANG TÌM KIẾM";
-    if (s === "prepared") return "ĐÃ LẬP KẾ HOẠCH";
-    if (s === "no_verified_feasible") return "CHƯA CÓ CẤU HÌNH KHẢ THI";
-    if (s === "observed_required_seed_oom") return "TRÀN VRAM (OOM)";
-    if (s === "confirmed_constraint_failure") return "VI PHẠM RÀNG BUỘC";
-    if (s === "infeasible") return "KHÔNG KHẢ THI";
-    if (s === "interrupted") return "ĐÃ TẠM DỪNG";
+    if (s === "empirical_optimal_in_declared_space" || s === "empirical_optimal") return "Tối ưu thực nghiệm";
+    if (s === "fully_trained_best_observed" || s === "observed_best_in_explored_space" || s === "observed_best") return "Tốt nhất đã đo";
+    if (s === "contended_smoke_not_certified") return "Tranh tài nguyên (Không chứng nhận)";
+    if (s === "modified_protocol_optimality_not_certified") return "Đã sửa protocol";
+    if (s === "confirmed_feasible") return "Đạt khả thi";
+    if (s === "ok") return "Đạt";
+    if (s === "complete") return "Hoàn tất";
+    if (s === "search") return "Đang tìm kiếm";
+    if (s === "running") return "Đang chạy";
+    if (s === "prepared") return "Đã lập kế hoạch";
+    if (s === "pending") return "Chờ chạy";
+    if (s === "timeout") return "Hết giờ (Timeout)";
+    if (s === "unresolved") return "Chưa đủ seed";
+    if (s === "no_verified_feasible_selection" || s === "no_verified_feasible") return "Chưa có cấu hình khả thi";
+    if (s === "observed_required_seed_oom" || s === "oom") return "Tràn VRAM (OOM)";
+    if (s === "confirmed_constraint_failure") return "Vi phạm ràng buộc";
+    if (s === "infeasible") return "Không khả thi";
+    if (s === "interrupted") return "Đã tạm dừng";
+    if (s === "error" || s === "failed") return "Lỗi chạy";
     return raw || "—";
   }
 
@@ -104,7 +126,7 @@
     if (kind === "research") return "Nghiên cứu v1";
     if (kind === "legacy_training") return "Huấn luyện cũ";
     if (kind === "benchmark") return "Đối chứng Benchmark";
-    if (kind === "algorithm_study") return "Nghiên cứu đa bộ dữ liệu";
+    if (kind === "algorithm_study") return "Nghiên cứu đa bộ";
     return kind || "—";
   }
 
@@ -115,6 +137,7 @@
   // ---- View 1: Tổng quan & Phần cứng ----
   async function initOverview() {
     const hwEl = document.getElementById("hw-cards");
+    const sumEl = document.getElementById("overview-summary");
     const runsBody = document.getElementById("runs-table-body");
     const bmBody = document.getElementById("benchmarks-table-body");
     const filterInput = document.getElementById("runs-filter");
@@ -126,15 +149,18 @@
         const hw = await apiGet("/api/hardware");
         const gpu = hw.gpus && hw.gpus[0];
         const vramPct = gpu && gpu.vram_total_mb ? Math.min(100, Math.round((gpu.vram_used_mb / gpu.vram_total_mb) * 100)) : 0;
+        const cpuPct = Math.min(100, Math.round(hw.cpu_percent || 0));
         const ramPct = Math.min(100, Math.round(hw.ram_percent || 0));
+        const diskUsed = Math.max(0, (hw.disk_total_mb || 0) - (hw.disk_free_mb || 0));
+        const diskPct = hw.disk_total_mb ? Math.min(100, Math.round((diskUsed / hw.disk_total_mb) * 100)) : 0;
         const gpuCard = gpu
           ? `<div class="card"><div class="kpi-label">Card đồ họa (GPU)</div><div class="kpi-value" style="font-size:1.05rem;">${esc(gpu.name)}</div><div class="kpi-sub">VRAM: ${fmt(gpu.vram_used_mb, 0)} / ${fmt(gpu.vram_total_mb, 0)} MiB · Nhiệt: ${gpu.temperature_c !== null ? fmt(gpu.temperature_c, 0) + "°C" : "N/A"} · Tải: ${gpu.gpu_utilization_percent !== null ? fmt(gpu.gpu_utilization_percent, 0) + "%" : "N/A"}</div><div class="hw-bar progress-track"><div class="progress-fill" style="width:${vramPct}%"></div></div></div>`
           : `<div class="card"><div class="kpi-label">Chế độ tính toán</div><div class="kpi-value">CPU</div><div class="kpi-sub">Không có CUDA; torch ${esc(hw.torch_version || "N/A")}</div></div>`;
         hwEl.innerHTML = `
           ${gpuCard}
-          <div class="card"><div class="kpi-label">Vi xử lý (CPU)</div><div class="kpi-value">${fmt(hw.cpu_percent, 1)}%</div><div class="kpi-sub">${hw.logical_cpus} luồng xử lý · Chế độ ${esc(hw.mode.toUpperCase())}</div></div>
+          <div class="card"><div class="kpi-label">Vi xử lý (CPU)</div><div class="kpi-value">${fmt(hw.cpu_percent, 1)}%</div><div class="kpi-sub">${hw.logical_cpus} luồng xử lý · Chế độ ${esc(hw.mode.toUpperCase())}</div><div class="hw-bar progress-track"><div class="progress-fill" style="width:${cpuPct}%"></div></div></div>
           <div class="card"><div class="kpi-label">Bộ nhớ hệ thống (RAM)</div><div class="kpi-value">${fmt(hw.ram_used_mb, 0)} MiB</div><div class="kpi-sub">Còn trống: ${fmt(hw.ram_available_mb, 0)} / ${fmt(hw.ram_total_mb, 0)} MiB (${fmt(hw.ram_percent, 1)}%)</div><div class="hw-bar progress-track"><div class="progress-fill" style="width:${ramPct}%"></div></div></div>
-          <div class="card"><div class="kpi-label">Dung lượng ổ đĩa trống</div><div class="kpi-value">${fmt(hw.disk_free_mb / 1024, 1)} GB</div><div class="kpi-sub">Tổng dung lượng: ${fmt(hw.disk_total_mb / 1024, 1)} GB</div></div>
+          <div class="card"><div class="kpi-label">Dung lượng ổ đĩa trống</div><div class="kpi-value">${fmt(hw.disk_free_mb / 1024, 1)} GB</div><div class="kpi-sub">Đã dùng ${diskPct}% / Tổng ${fmt(hw.disk_total_mb / 1024, 1)} GB</div><div class="hw-bar progress-track"><div class="progress-fill" style="width:${diskPct}%"></div></div></div>
         `;
       } catch (err) {
         if (hwEl) hwEl.innerHTML = `<div class="alert alert-danger">${esc(err.message)}</div>`;
@@ -153,31 +179,55 @@
         runsBody.innerHTML = `<tr><td colspan="9" class="subtitle">Chưa có lượt chạy phù hợp trong thư mục kết quả.</td></tr>`;
         return;
       }
-      runsBody.innerHTML = filtered.map((r) => `
+      runsBody.innerHTML = filtered.map((r) => {
+        const rel = String(r.rel_path || r.name || "");
+        const parts = rel.split("/").filter(Boolean);
+        const leaf = parts.pop() || rel;
+        const parent = parts.join("/");
+        const st = r.verification_status || r.phase;
+        return `
         <tr>
-          <td class="mono">${esc(r.rel_path || r.name)}</td>
+          <td title="${esc(rel)}">
+            <div class="run-name-main">${esc(leaf)}</div>
+            ${parent ? `<div class="run-name-sub">${esc(parent)}</div>` : ""}
+          </td>
           <td>${esc(kindLabel(r.kind))}</td>
           <td>${esc(r.task)}</td>
           <td>${esc(r.method)}</td>
-          <td><span class="badge ${badgeClass(r.verification_status || r.phase)}" title="${esc(r.verification_status || r.phase)}">${esc(statusLabel(r.verification_status || r.phase))}</span></td>
+          <td><span class="badge ${badgeClass(st)}" title="${esc(st)}">${esc(statusLabel(st))}</span></td>
           <td class="mono">${esc(r.selected_config_id || "—")}</td>
           <td class="num">${fmt(r.best_quality, 4)}</td>
           <td class="num">${fmt(r.utility, 4)}</td>
           <td>
-            <a class="btn btn-sm" href="/analysis?run=${encodeURIComponent(r.rel_path)}">Phân tích</a>
-            <a class="btn btn-sm" href="/monitor?run=${encodeURIComponent(r.rel_path)}">Theo dõi</a>
-            <a class="btn btn-sm" href="/export?run=${encodeURIComponent(r.rel_path)}">Xuất</a>
+            <a class="btn btn-sm" href="/analysis?run=${encodeURIComponent(rel)}">Phân tích</a>
+            <a class="btn btn-sm" href="/monitor?run=${encodeURIComponent(rel)}">Theo dõi</a>
+            <a class="btn btn-sm" href="/export?run=${encodeURIComponent(rel)}">Xuất</a>
           </td>
         </tr>
-      `).join("");
+      `;
+      }).join("");
     }
 
     async function loadRuns() {
       try {
         const data = await apiGet("/api/runs");
         cachedRuns = data.runs || [];
-        renderRuns();
         const bms = [...(data.benchmarks || []), ...(data.algorithm_studies || [])];
+        if (sumEl) {
+          const totalRuns = cachedRuns.length;
+          const okCount = cachedRuns.filter((r) => {
+            const st = String(r.verification_status || "");
+            return st.includes("optimal") || st.includes("best") || st.includes("fully_trained");
+          }).length;
+          const evalCount = cachedRuns.filter((r) => r.has_evaluation).length;
+          sumEl.innerHTML = `
+            <div class="card"><div class="kpi-label">Tổng số lượt chạy</div><div class="kpi-value">${totalRuns}</div><div class="kpi-sub">Đã phát hiện trong thư mục kết quả</div></div>
+            <div class="card"><div class="kpi-label">Chọn được cấu hình</div><div class="kpi-value">${okCount}</div><div class="kpi-sub">Đạt tối ưu / tốt nhất trong không gian</div></div>
+            <div class="card"><div class="kpi-label">Đã đánh giá tập Test</div><div class="kpi-value">${evalCount}</div><div class="kpi-sub">Có đầy đủ Latency, PR, F1, Confusion Matrix</div></div>
+            <div class="card"><div class="kpi-label">Bộ đối chứng thuật toán</div><div class="kpi-value">${bms.length}</div><div class="kpi-sub">Benchmark &amp; nghiên cứu đa bộ dữ liệu</div></div>
+          `;
+        }
+        renderRuns();
         if (bmBody) {
           bmBody.innerHTML = bms.length
             ? bms.map((b) => `
@@ -207,18 +257,31 @@
   // ---- View 2: Theo dõi trực tiếp ----
   async function initMonitor() {
     const sel = document.getElementById("monitor-run-select");
+    const refreshBtn = document.getElementById("monitor-refresh-btn");
     const stopBtn = document.getElementById("safe-stop-btn");
     const msgEl = document.getElementById("monitor-status-msg");
+    const diagEl = document.getElementById("monitor-diagnostic-banner");
     const kpiEl = document.getElementById("monitor-kpis");
     const candBody = document.getElementById("monitor-candidates-body");
+    const logTitleEl = document.getElementById("monitor-log-title");
     const logEl = document.getElementById("monitor-worker-log");
     const jobsBody = document.getElementById("monitor-jobs-body");
 
-    const runsData = await apiGet("/api/runs");
-    const runs = runsData.runs || [];
-    sel.innerHTML = `<option value="">-- Chọn lượt chạy cần theo dõi --</option>` + runs.map((r) => `<option value="${esc(r.rel_path)}">${esc(r.rel_path)} (${esc(statusLabel(r.phase))})</option>`).join("");
-    const pre = queryParam("run") || (runs[0] && runs[0].rel_path) || "";
-    if (pre) sel.value = pre;
+    let pollCount = 0;
+
+    async function refreshRunList(preferRun) {
+      const runsData = await apiGet("/api/runs");
+      const runs = runsData.runs || [];
+      const cur = preferRun !== undefined ? preferRun : sel.value;
+      sel.innerHTML = `<option value="">-- Chọn lượt chạy cần theo dõi --</option>` + runs.map((r) => `<option value="${esc(r.rel_path)}">${esc(r.rel_path)} (${esc(statusLabel(r.verification_status || r.phase))})</option>`).join("");
+      if (cur && runs.some((r) => r.rel_path === cur)) {
+        sel.value = cur;
+      } else if (!cur && runs[0]) {
+        sel.value = runs[0].rel_path;
+      }
+    }
+
+    await refreshRunList(queryParam("run") || undefined);
 
     async function poll() {
       const target = sel.value;
@@ -226,21 +289,73 @@
       try {
         const data = await apiGet(url);
         const jobs = data.jobs || [];
+        if (jobs.some((j) => j.alive) && pollCount % 3 === 2) {
+          refreshRunList().catch(() => {});
+        }
+        pollCount += 1;
+
         jobsBody.innerHTML = jobs.length
-          ? jobs.map((j) => `<tr><td class="mono">${esc(j.job_id)}</td><td>${esc(j.mode)}</td><td class="mono">${esc(j.pid)}</td><td><span class="badge ${j.alive ? "badge-info" : "badge-muted"}">${j.alive ? "ĐANG CHẠY" : "ĐÃ DỪNG (" + j.returncode + ")"}</span></td><td class="mono">${esc(j.output)}</td></tr>`).join("")
-          : `<tr><td colspan="5" class="subtitle">Chưa có tiến trình nào được khởi chạy từ Web UI trong phiên này.</td></tr>`;
+          ? jobs.map((j) => {
+            const tail = (j.returncode && j.returncode !== 0 && !j.alive && Array.isArray(j.tail_output) && j.tail_output.length)
+              ? `<div class="subtitle" style="margin-top:0.25rem;color:var(--danger);white-space:normal;">${esc(j.tail_output.slice(-2).join(" | "))}</div>`
+              : "";
+            const stateBadge = j.alive
+              ? `<span class="badge badge-info">ĐANG CHẠY</span>`
+              : `<span class="badge ${j.returncode === 0 ? "badge-muted" : "badge-danger"}">${j.returncode === 0 ? "HOÀN TẤT (0)" : "LỖI (" + j.returncode + ")"}</span>`;
+            const stopCell = j.alive
+              ? `<button type="button" class="btn btn-sm btn-danger stop-job-btn" data-job-id="${esc(j.job_id)}">Dừng</button>`
+              : "—";
+            return `<tr><td class="mono">${esc(j.job_id)}</td><td>${esc(j.mode)}</td><td class="mono">${esc(j.pid)}</td><td>${stateBadge}${tail}</td><td class="mono">${esc(j.output)}</td><td>${stopCell}</td></tr>`;
+          }).join("")
+          : `<tr><td colspan="6" class="subtitle">Chưa có tiến trình nào được khởi chạy từ Web UI trong phiên này.</td></tr>`;
+
+        jobsBody.querySelectorAll(".stop-job-btn").forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            const jid = btn.getAttribute("data-job-id");
+            try {
+              const res = await apiPost("/api/stop", { job_id: jid });
+              msgEl.innerHTML = `<div class="alert alert-info">Đã gửi lệnh dừng an toàn tới job ${esc(jid)} (${esc(res.status)}).</div>`;
+              await poll();
+            } catch (err) {
+              msgEl.innerHTML = `<div class="alert alert-danger">${esc(err.message)}</div>`;
+            }
+          });
+        });
 
         const r = data.run;
         if (!r) {
+          if (diagEl) diagEl.innerHTML = "";
           kpiEl.innerHTML = "";
           candBody.innerHTML = "";
+          if (logTitleEl) logTitleEl.textContent = "Nhật ký huấn luyện mới nhất (120 dòng cuối)";
           logEl.textContent = "Hãy chọn một lượt chạy ở phía trên để theo dõi tiến độ epoch và nhật ký worker.log.";
           return;
         }
+
+        if (diagEl) {
+          if (r.verification_status === "no_verified_feasible_selection" && (r.timeout_count || 0) > 0) {
+            diagEl.innerHTML = `
+              <div class="alert alert-warn">
+                <strong>Lượt chạy này chưa chọn được cấu hình do hết ngân sách thời gian (${r.timeout_count} lần thử bị timeout trong ${fmt(r.budget_seconds, 0)}s).</strong><br/>
+                Ngân sách chia cho từng lần thử chưa đủ hoàn thành trọn vẹn 1 cấu hình đủ epoch &amp; seed. Gợi ý: vào <a href="/launcher">Chạy mới</a> và chọn kịch bản <strong>Thử nhanh</strong> (3 epochs · 1 seed · compact) hoặc tăng ngân sách thời gian cho bộ dữ liệu lớn.
+              </div>
+            `;
+          } else if (r.verification_status === "no_verified_feasible_selection") {
+            diagEl.innerHTML = `
+              <div class="alert alert-warn">
+                <strong>Chưa có cấu hình nào hoàn tất đủ điều kiện khả thi</strong> (trạng thái: ${esc(statusLabel(r.verification_status))}). Hãy kiểm tra log bên dưới để xem chi tiết.
+              </div>
+            `;
+          } else {
+            diagEl.innerHTML = "";
+          }
+        }
+
         const lt = r.latest_trial || {};
         const epPct = lt.trial_epochs ? Math.min(100, Math.round(((lt.epochs_completed || 0) / lt.trial_epochs) * 100)) : 0;
+        const phaseStatus = r.verification_status === "no_verified_feasible_selection" ? r.verification_status : r.phase;
         kpiEl.innerHTML = `
-          <div class="card"><div class="kpi-label">Giai đoạn</div><div class="kpi-value" style="font-size:1.1rem;">${esc(statusLabel(r.phase))}</div><div class="kpi-sub">${esc(r.task)} · ${esc(r.method)}</div></div>
+          <div class="card"><div class="kpi-label">Trạng thái</div><div class="kpi-value" style="font-size:1.05rem;"><span class="badge ${badgeClass(phaseStatus)}">${esc(statusLabel(phaseStatus))}</span></div><div class="kpi-sub">${esc(r.task)} · ${esc(r.method)} · Hoàn tất ${r.completed_candidates ?? 0}/${r.total_candidates ?? 0}</div></div>
           <div class="card"><div class="kpi-label">Ngân sách còn lại</div><div class="kpi-value">${r.remaining_seconds !== null ? fmt(r.remaining_seconds, 1) + "s" : "—"}</div><div class="kpi-sub">Tổng: ${fmt(r.budget_seconds, 0)}s · Đã chạy: ${fmt(r.elapsed_seconds, 1)}s</div></div>
           <div class="card"><div class="kpi-label">Lần thử mới nhất</div><div class="kpi-value" style="font-size:1.05rem;">${esc(lt.attempt_id || "—")}</div><div class="kpi-sub">Epoch ${lt.epochs_completed ?? 0}/${lt.trial_epochs ?? "?"} · Điểm=${fmt(lt.quality, 4)} · VRAM=${fmt(lt.memory_mb, 1)} MiB</div><div class="progress-track" style="margin-top:0.4rem;"><div class="progress-fill" style="width:${epPct}%"></div></div></div>
           <div class="card"><div class="kpi-label">Tiến trình đang chạy</div><div class="kpi-value">${(r.live_workers || []).length}</div><div class="kpi-sub">${(r.live_workers || []).map((w) => "PID " + w.pid).join(", ") || "Không có tiến trình con nào đang hoạt động"}</div></div>
@@ -256,6 +371,11 @@
             <td class="num">${fmt(c.best_quality, 4)}</td>
           </tr>
         `).join("");
+        if (logTitleEl) {
+          logTitleEl.textContent = r.worker_log_attempt
+            ? `Nhật ký huấn luyện mới nhất — ${r.worker_log_attempt} (120 dòng cuối)`
+            : "Nhật ký huấn luyện mới nhất (120 dòng cuối)";
+        }
         logEl.textContent = (r.worker_log && r.worker_log.length) ? r.worker_log.join("\n") : "(Chưa có đầu ra trong worker.log)";
       } catch (err) {
         msgEl.innerHTML = `<div class="alert alert-danger">${esc(err.message)}</div>`;
@@ -263,6 +383,12 @@
     }
 
     sel.addEventListener("change", poll);
+    if (refreshBtn) {
+      refreshBtn.addEventListener("click", async () => {
+        await refreshRunList();
+        await poll();
+      });
+    }
     if (stopBtn) {
       stopBtn.addEventListener("click", async () => {
         try {
@@ -286,24 +412,66 @@
     const modelSel = document.getElementById("launch-models");
     const methodSel = document.getElementById("launch-method");
     const ruleSel = document.getElementById("launch-rule");
+    const spaceSel = document.getElementById("launch-space");
+    const epochsInput = document.getElementById("launch-epochs");
     const budgetInput = document.getElementById("launch-budget");
+    const seedsInput = document.getElementById("launch-seeds");
+    const advisoryEl = document.getElementById("budget-advisory");
     const inspectBtn = document.getElementById("btn-inspect-dataset");
     const inspectOut = document.getElementById("inspect-result");
     const previewEl = document.getElementById("cli-preview");
     const launchBtn = document.getElementById("btn-launch-job");
     const launchMsg = document.getElementById("launch-result");
 
-    if (dsSel && resData.datasets) {
-      dsSel.innerHTML = `<option value="">-- Chọn nhanh bộ dữ liệu có sẵn --</option>` + resData.datasets.map((d) => `<option value="${esc(d.path)}">${esc(d.name)} (${esc(d.kind)})</option>`).join("");
+    const allWeights = resData.weights || [];
+    const allDatasets = resData.datasets || [];
+    let inspectedTrainCount = null;
+
+    function isLikelyDetectionData() {
+      const p = (dataInput.value || "").trim().toLowerCase();
+      if (!p) return true;
+      if (p.endsWith(".yaml") || p.endsWith(".yml")) return true;
+      const matched = allDatasets.find((d) => d.path.toLowerCase() === p);
+      return matched ? matched.kind === "detection/yaml" : false;
+    }
+
+    function currentApproxImages() {
+      if (inspectedTrainCount !== null) return inspectedTrainCount;
+      const p = (dataInput.value || "").trim().toLowerCase();
+      const matched = allDatasets.find((d) => d.path.toLowerCase() === p);
+      return matched && typeof matched.approx_train_images === "number" ? matched.approx_train_images : null;
+    }
+
+    if (dsSel && allDatasets.length) {
+      dsSel.innerHTML = `<option value="">-- Chọn nhanh bộ dữ liệu có sẵn --</option>` + allDatasets.map((d) => {
+        const cntTxt = d.approx_train_images ? ` · ~${d.approx_train_images} ảnh` : "";
+        return `<option value="${esc(d.path)}">${esc(d.name)} (${esc(d.kind)}${cntTxt})</option>`;
+      }).join("");
       dsSel.addEventListener("change", () => {
-        if (dsSel.value) dataInput.value = dsSel.value;
+        if (dsSel.value) {
+          dataInput.value = dsSel.value;
+          inspectedTrainCount = null;
+          if (!isLikelyDetectionData() && modelSel) modelSel.value = "";
+        }
         updatePreview();
       });
-      if (resData.datasets[0] && !dataInput.value) dataInput.value = resData.datasets[0].path;
+      if (!dataInput.value) {
+        dataInput.value = allDatasets[0].path;
+        dsSel.value = allDatasets[0].path;
+      }
     }
-    if (modelSel && resData.weights) {
-      modelSel.innerHTML = `<option value="">(Dùng mặc định theo không gian cấu hình)</option>` + resData.weights.map((w) => `<option value="${esc(w.path)}">${esc(w.name)} — ${w.parameters ? (w.parameters / 1e6).toFixed(2) + "M tham số" : w.size_mb + " MB"}${w.gflops_640 ? " | " + w.gflops_640.toFixed(2) + " GFLOPs@640" : ""}</option>`).join("");
+
+    if (modelSel) {
+      let opts = "";
+      if (allWeights.length > 1) {
+        opts += `<option value="__ALL_LOCAL_PT__" selected>Tất cả ${allWeights.length} trọng số .pt trong weights/ (Khuyên dùng cho Detection)</option>`;
+      }
+      opts += allWeights.map((w, idx) => `<option value="${esc(w.path)}" ${allWeights.length === 1 && idx === 0 ? "selected" : ""}>${esc(w.name)} — ${w.parameters ? (w.parameters / 1e6).toFixed(2) + "M tham số" : w.size_mb + " MB"}${w.gflops_640 ? " | " + w.gflops_640.toFixed(2) + " GFLOPs@640" : ""}</option>`).join("");
+      opts += `<option value="">(Không dùng .pt — train .yaml từ đầu hoặc bài toán Classification)</option>`;
+      modelSel.innerHTML = opts;
+      if (!isLikelyDetectionData()) modelSel.value = "";
     }
+
     if (methodSel && resData.methods) {
       methodSel.innerHTML = resData.methods.map((m) => `<option value="${esc(m)}" ${m === "adaptive_full" ? "selected" : ""}>${esc(m)}</option>`).join("");
     }
@@ -311,28 +479,69 @@
       ruleSel.innerHTML = resData.rules.map((r) => `<option value="${esc(r)}">${esc(r)}</option>`).join("");
     }
 
+    function selectedModelsList() {
+      if (!modelSel || !modelSel.value) return [];
+      if (modelSel.value === "__ALL_LOCAL_PT__") return allWeights.map((w) => w.path);
+      return [modelSel.value];
+    }
+
     function readPayload(confirmed) {
       const mode = document.getElementById("launch-mode").value;
-      const modelsVal = modelSel && modelSel.value ? [modelSel.value] : [];
+      const modelsVal = selectedModelsList();
       const selectedMethod = methodSel.value || "adaptive_full";
       const bmMethods = Array.from(new Set([selectedMethod, "adaptive_full", "adaptive_ehvi", "random"]));
       return {
         mode,
         data: dataInput.value.trim(),
         device: document.getElementById("launch-device").value.trim() || "auto",
-        space: document.getElementById("launch-space").value,
+        space: spaceSel ? spaceSel.value : "core",
         method: selectedMethod,
         methods: mode === "benchmark" ? bmMethods : undefined,
         selection_rule: ruleSel.value,
         detection_metric: document.getElementById("launch-metric").value,
-        full_epochs: Number(document.getElementById("launch-epochs").value || 10),
-        budget_seconds: Number((budgetInput && budgetInput.value) || 300),
-        seeds: document.getElementById("launch-seeds").value.trim(),
+        full_epochs: Number((epochsInput && epochsInput.value) || 5),
+        budget_seconds: Number((budgetInput && budgetInput.value) || 600),
+        seeds: seedsInput ? seedsInput.value.trim() : "17 29",
         weights: document.getElementById("launch-weights").value.trim(),
         output: document.getElementById("launch-output").value.trim(),
         models: modelsVal,
         confirmed: Boolean(confirmed),
       };
+    }
+
+    function updateBudgetAdvisory(p) {
+      if (!advisoryEl) return;
+      const nImgs = currentApproxImages();
+      const seedsCount = Math.max(1, (p.seeds || "17").replace(/,/g, " ").split(/\s+/).filter(Boolean).length);
+      const isCpu = String(p.device || "").toLowerCase() === "cpu";
+      if (!nImgs || p.mode === "plan-search") {
+        advisoryEl.innerHTML = "";
+        return;
+      }
+      // Empirical baseline calibrated on RTX 3050 + Ultralytics YOLO (~30s/epoch per 1000 train images; ~5x on CPU)
+      const secPerEpoch = Math.max(1.5, (nImgs / 1000) * (isCpu ? 150.0 : 30.0));
+      const estOneSeed = 25 + secPerEpoch * Math.max(1, p.full_epochs);
+      const warnThreshold = estOneSeed * Math.max(1.15, seedsCount * 0.5);
+      const minRecommended = Math.round(estOneSeed * seedsCount * 1.5);
+      if (p.budget_seconds < warnThreshold) {
+        advisoryEl.innerHTML = `
+          <div class="alert alert-warn" style="display:flex;justify-content:space-between;align-items:center;gap:0.75rem;flex-wrap:wrap;">
+            <div>
+              <strong>Cảnh báo nguy cơ hết giờ (Timeout):</strong> Bộ dữ liệu có ~<strong>${nImgs} ảnh train</strong>, chạy <strong>${p.full_epochs} epochs × ${seedsCount} seed</strong> ước tính cần tối thiểu khoảng <strong>${minRecommended} giây</strong> để kịp xác nhận trọn vẹn ít nhất vài cấu hình. Ngân sách hiện tại (${p.budget_seconds}s) rất dễ bị ngắt giữa chừng.
+            </div>
+            <button type="button" id="apply-safe-budget-btn" class="btn btn-sm">Áp dụng gợi ý (${minRecommended}s)</button>
+          </div>
+        `;
+        const applyBtn = document.getElementById("apply-safe-budget-btn");
+        if (applyBtn) {
+          applyBtn.addEventListener("click", () => {
+            if (budgetInput) budgetInput.value = String(minRecommended);
+            updatePreview();
+          });
+        }
+      } else {
+        advisoryEl.innerHTML = "";
+      }
     }
 
     function updatePreview() {
@@ -365,7 +574,33 @@
       }
       if (p.models.length) parts.push("--models", ...p.models);
       previewEl.textContent = parts.join(" ");
+      updateBudgetAdvisory(p);
     }
+
+    document.querySelectorAll(".scenario-card").forEach((card) => {
+      card.addEventListener("click", () => {
+        const sc = card.getAttribute("data-scenario");
+        document.querySelectorAll(".scenario-card").forEach((c) => c.classList.remove("active"));
+        card.classList.add("active");
+        if (sc === "fast") {
+          if (epochsInput) epochsInput.value = "3";
+          if (budgetInput) budgetInput.value = "300";
+          if (seedsInput) seedsInput.value = "17";
+          if (spaceSel) spaceSel.value = "compact";
+        } else if (sc === "balanced") {
+          if (epochsInput) epochsInput.value = "5";
+          if (budgetInput) budgetInput.value = "600";
+          if (seedsInput) seedsInput.value = "17 29";
+          if (spaceSel) spaceSel.value = "core";
+        } else if (sc === "paper") {
+          if (epochsInput) epochsInput.value = "10";
+          if (budgetInput) budgetInput.value = "900";
+          if (seedsInput) seedsInput.value = "17 29 43";
+          if (spaceSel) spaceSel.value = "core";
+        }
+        updatePreview();
+      });
+    });
 
     document.querySelectorAll(".budget-preset-btn").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -399,6 +634,10 @@
         try {
           const out = await apiPost("/api/inspect", { data: dataInput.value.trim(), device: document.getElementById("launch-device").value.trim() || "cpu" });
           const ds = out.dataset || {};
+          if (ds.counts && typeof ds.counts.train === "number") {
+            inspectedTrainCount = ds.counts.train;
+            updatePreview();
+          }
           const au = ds.audit || {};
           const leak = (au.cross_split_leakage && au.cross_split_leakage.has_leakage) ? "CẢNH BÁO: PHÁT HIỆN RÒ RỈ XUYÊN TẬP" : "An toàn (0 ảnh trùng xuyên tập)";
           const dup = (au.intra_split_duplicates && au.intra_split_duplicates.total_duplicate_files) || 0;
@@ -536,6 +775,64 @@
         <div class="card"><div class="kpi-label">Hypervolume 3D</div><div class="kpi-value">${fmt(detail.hypervolume_3d, 4)}</div><div class="kpi-sub">AUARC: ${fmt(detail.anytime && detail.anytime.auarc, 4)}</div></div>
         <div class="card"><div class="kpi-label">Sai số Surrogate (LOOCV MAE)</div><div class="kpi-value">${detail.surrogate_loocv && detail.surrogate_loocv.available ? fmt(detail.surrogate_loocv.loocv_mae, 4) : "—"}</div><div class="kpi-sub">Kernel: ${esc((detail.surrogate_loocv && detail.surrogate_loocv.kernel) || "Không dùng")}</div></div>
       `;
+
+      const specEl = document.getElementById("analysis-selected-spec");
+      if (specEl) {
+        const selCand = (rep.candidates || []).find((c) => c.index === dec.selected_index);
+        if (selCand && selCand.config) {
+          const cfg = selCand.config;
+          const effBatch = Number(cfg.batch || 1) * Number(cfg.accumulation || 1);
+          specEl.innerHTML = `
+            <h2>Cấu hình tối ưu được chọn — c${String(selCand.index).padStart(2, "0")} <span class="mono">(${esc(selCand.config_id)})</span></h2>
+            <div class="spec-grid">
+              <div class="spec-item"><div class="spec-label">Mô hình</div><div class="spec-val">${esc(baseName(cfg.model))}</div></div>
+              <div class="spec-item"><div class="spec-label">Kích thước ảnh</div><div class="spec-val">${esc(cfg.imgsz)} px</div></div>
+              <div class="spec-item"><div class="spec-label">Batch × Tích lũy</div><div class="spec-val">${esc(cfg.batch)} × ${esc(cfg.accumulation)} (eff ${effBatch})</div></div>
+              <div class="spec-item"><div class="spec-label">Độ chính xác / Opt</div><div class="spec-val">${esc(String(cfg.precision || "fp32").toUpperCase())} / ${esc(cfg.optimizer)}</div></div>
+              <div class="spec-item"><div class="spec-label">Learning Rate / WD</div><div class="spec-val">${esc(cfg.lr0)} / ${esc(cfg.weight_decay)}</div></div>
+              <div class="spec-item"><div class="spec-label">Freeze / Epochs</div><div class="spec-val">${esc(cfg.freeze ?? 0)} block / ${esc(prot.full_epochs)} ep</div></div>
+              <div class="spec-item"><div class="spec-label">Thời gian TB / seed</div><div class="spec-val">${fmt(selCand.time_mean, 2)}s</div></div>
+              <div class="spec-item"><div class="spec-label">VRAM / RAM đỉnh</div><div class="spec-val">${fmt(selCand.memory_max, 1)} MiB</div></div>
+            </div>
+          `;
+        } else {
+          specEl.innerHTML = `
+            <h2>Chưa có cấu hình được chọn</h2>
+            <div class="alert alert-warn" style="margin-bottom:0;">
+              Lượt chạy này kết thúc với trạng thái <strong>${esc(statusLabel(dec.verification_status))}</strong> nên chưa khóa được cấu hình tối ưu nào. Hãy kiểm tra bảng cấu hình bên dưới hoặc xem nhật ký ở <a href="/monitor?run=${encodeURIComponent(target)}">Theo dõi trực tiếp</a>.
+            </div>
+          `;
+        }
+      }
+
+      const candTableBody = document.getElementById("analysis-candidates-body");
+      if (candTableBody) {
+        const paretoSet = new Set(dec.pareto || []);
+        const cands = rep.candidates || [];
+        candTableBody.innerHTML = cands.length
+          ? cands.map((c) => {
+            const cfg = c.config || {};
+            const isSel = c.index === dec.selected_index;
+            const isPar = paretoSet.has(c.config_id);
+            const tag = `${isSel ? "★ " : ""}${isPar ? "Pareto" : ""}`;
+            return `
+              <tr>
+                <td class="mono">c${String(c.index).padStart(2, "0")} ${tag ? `<span class="badge ${isSel ? "badge-info" : "badge-success"}">${esc(tag.trim())}</span>` : ""}</td>
+                <td>${esc(baseName(cfg.model))}</td>
+                <td class="num">${esc(cfg.imgsz)}</td>
+                <td class="num">${esc(cfg.batch)} × ${esc(cfg.accumulation)}</td>
+                <td>${esc(String(cfg.precision || "").toUpperCase())} / ${esc(cfg.optimizer)}</td>
+                <td class="num">${esc(cfg.lr0)}</td>
+                <td><span class="badge ${badgeClass(c.state)}" title="${esc(c.state)}">${esc(statusLabel(c.state))}</span></td>
+                <td class="num">${fmt(c.quality_mean, 4)}</td>
+                <td class="num">${c.time_mean !== null && c.time_mean !== undefined ? fmt(c.time_mean, 2) + "s" : "—"}</td>
+                <td class="num">${c.memory_max !== null && c.memory_max !== undefined ? fmt(c.memory_max, 1) + " MiB" : "—"}</td>
+                <td class="num">${fmt(c.utility, 5)}</td>
+              </tr>
+            `;
+          }).join("")
+          : `<tr><td colspan="11" class="subtitle">Chưa có cấu hình nào được ghi nhận.</td></tr>`;
+      }
 
       window.NCKHCharts.renderParetoChart(document.getElementById("chart-pareto"), rep.candidates || [], dec, detMetric);
       window.NCKHCharts.renderLearningCurvesChart(document.getElementById("chart-learning"), (detail.state && detail.state.results) || {}, dec.selected_index, detMetric);

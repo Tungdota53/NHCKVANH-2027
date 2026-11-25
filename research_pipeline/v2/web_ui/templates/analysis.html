@@ -3,7 +3,7 @@
 <div class="page-header">
   <div>
     <h1>Phân tích &amp; Biên Pareto</h1>
-    <div class="subtitle">Khám phá đánh đổi Chất lượng – Thời gian – VRAM, đường học, dự báo Surrogate, hội tụ thời gian thực và kết quả tập Test.</div>
+    <div class="subtitle">Cấu hình được chọn, đánh đổi Chất lượng – Thời gian – VRAM, đường học, dự báo Surrogate và đánh giá tập Test.</div>
   </div>
   <div>
     <select id="analysis-run-select" style="min-width:340px;"></select>
@@ -11,6 +11,8 @@
 </div>
 
 <div id="analysis-kpis" class="grid grid-4" style="margin-bottom:1rem;"></div>
+
+<div id="analysis-selected-spec" class="card"></div>
 
 <div class="grid grid-2">
   <div class="card">
@@ -35,6 +37,30 @@
     <h2>Hội tụ theo thời gian thực (Anytime)</h2>
     <div class="subtitle" style="margin:-0.45rem 0 0.65rem 0;">Điểm hữu ích U tốt nhất đạt được tính theo từng giây tìm kiếm đã dùng.</div>
     <div id="chart-anytime" class="chart-box"></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Bảng tổng hợp tất cả cấu hình đã thử</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Mã</th>
+          <th>Mô hình</th>
+          <th class="num">ImgSz</th>
+          <th class="num">Batch × Accum</th>
+          <th>Precision / Opt</th>
+          <th class="num">LR</th>
+          <th>Trạng thái</th>
+          <th class="num">Val Quality</th>
+          <th class="num">Thời gian</th>
+          <th class="num">VRAM đỉnh</th>
+          <th class="num">Utility U</th>
+        </tr>
+      </thead>
+      <tbody id="analysis-candidates-body"></tbody>
+    </table>
   </div>
 </div>
 

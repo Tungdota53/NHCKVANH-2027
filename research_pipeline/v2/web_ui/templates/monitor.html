@@ -3,15 +3,17 @@
 <div class="page-header">
   <div>
     <h1>Theo dõi trực tiếp</h1>
-    <div class="subtitle">Cập nhật tự động ngân sách còn lại, tiến độ từng epoch, VRAM tiêu thụ và nhật ký worker.</div>
+    <div class="subtitle">Tự động cập nhật tiến độ epoch, ngân sách còn lại, lỗi hết giờ / VRAM và nhật ký huấn luyện đã làm sạch.</div>
   </div>
   <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
     <select id="monitor-run-select" style="min-width:300px;"></select>
+    <button id="monitor-refresh-btn" type="button" class="btn">Làm mới danh sách</button>
     <button id="safe-stop-btn" type="button" class="btn btn-danger">Dừng an toàn</button>
   </div>
 </div>
 
 <div id="monitor-status-msg"></div>
+<div id="monitor-diagnostic-banner"></div>
 
 <div id="monitor-kpis" class="grid grid-4" style="margin-bottom:1rem;"></div>
 
@@ -26,7 +28,7 @@
             <th>Mô hình</th>
             <th class="num">Ảnh / Batch</th>
             <th class="num">LR</th>
-            <th class="num">Số lần thử</th>
+            <th class="num">Lần thử</th>
             <th>Trạng thái</th>
             <th class="num">Điểm tốt nhất</th>
           </tr>
@@ -46,7 +48,8 @@
             <th>Chế độ</th>
             <th>PID</th>
             <th>Trạng thái</th>
-            <th>Thư mục lưu</th>
+            <th>Thư mục / Đầu ra</th>
+            <th>Thao tác</th>
           </tr>
         </thead>
         <tbody id="monitor-jobs-body"></tbody>
@@ -56,7 +59,7 @@
 </div>
 
 <div class="card">
-  <h2>Nhật ký huấn luyện mới nhất (120 dòng cuối)</h2>
+  <h2 id="monitor-log-title">Nhật ký huấn luyện mới nhất (120 dòng cuối)</h2>
   <pre id="monitor-worker-log" class="log-box">Đang tải nhật ký...</pre>
 </div>
 {% endblock %}

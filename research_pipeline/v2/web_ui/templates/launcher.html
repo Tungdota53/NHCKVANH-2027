@@ -3,7 +3,7 @@
 <div class="page-header">
   <div>
     <h1>Tạo &amp; Chạy thực nghiệm mới</h1>
-    <div class="subtitle">Giao diện tối giản: chỉ cần chọn dữ liệu, trọng số và ngân sách thời gian. Tùy chọn nghiên cứu sâu nằm gọn trong mục nâng cao.</div>
+    <div class="subtitle">Chọn kịch bản nhanh theo nhu cầu hoặc tùy chỉnh chi tiết; hệ thống tự kiểm tra rủi ro hết giờ và rò rỉ dữ liệu trước khi chạy.</div>
   </div>
 </div>
 
@@ -31,7 +31,22 @@
 </div>
 
 <div class="card">
-  <h2>2. Cài đặt cơ bản — Chỉ cần chọn 4 mục</h2>
+  <h2>2. Chọn kịch bản nhanh &amp; Cài đặt cơ bản</h2>
+  <div class="scenario-cards" style="margin-bottom:1rem;">
+    <button type="button" class="scenario-card" data-scenario="fast">
+      <div class="scenario-title">Thử nhanh (3–5 phút)</div>
+      <div class="scenario-desc">3 epochs · 1 seed · 3 cấu hình gọn nhẹ · 300s · dùng .pt sẵn có.</div>
+    </button>
+    <button type="button" class="scenario-card active" data-scenario="balanced">
+      <div class="scenario-title">Cân bằng tiêu chuẩn (10 phút)</div>
+      <div class="scenario-desc">5 epochs · 2 seeds · 12 cấu hình chuẩn · 600s · phù hợp hầu hết GPU.</div>
+    </button>
+    <button type="button" class="scenario-card" data-scenario="paper">
+      <div class="scenario-title">NCKH chuẩn bài báo (15–20 phút)</div>
+      <div class="scenario-desc">10 epochs · 3 seeds · 12 cấu hình · 900s · đủ độ tin cậy đa seed.</div>
+    </button>
+  </div>
+
   <div class="form-row">
     <div>
       <label for="launch-mode">Chế độ chạy</label>
@@ -42,20 +57,21 @@
       </select>
     </div>
     <div>
-      <label for="launch-models">Trọng số khởi tạo (.pt có sẵn)</label>
+      <label for="launch-models">Trọng số khởi tạo (.pt trong weights/)</label>
       <select id="launch-models"></select>
     </div>
     <div>
       <label for="launch-epochs">Số epoch đầy đủ</label>
-      <input id="launch-epochs" type="number" min="1" value="10" />
+      <input id="launch-epochs" type="number" min="1" value="5" />
     </div>
     <div>
       <label for="launch-budget">Ngân sách tìm kiếm (giây)</label>
-      <input id="launch-budget" type="number" min="10" value="300" />
+      <input id="launch-budget" type="number" min="10" value="600" />
       <div class="pill-row">
-        <button type="button" class="pill-btn budget-preset-btn" data-budget="180">Nhanh 3 phút</button>
-        <button type="button" class="pill-btn budget-preset-btn" data-budget="300">Chuẩn 5 phút</button>
-        <button type="button" class="pill-btn budget-preset-btn" data-budget="900">NCKH 15 phút</button>
+        <button type="button" class="pill-btn budget-preset-btn" data-budget="300">5 phút</button>
+        <button type="button" class="pill-btn budget-preset-btn" data-budget="600">10 phút</button>
+        <button type="button" class="pill-btn budget-preset-btn" data-budget="900">15 phút</button>
+        <button type="button" class="pill-btn budget-preset-btn" data-budget="1800">30 phút</button>
       </div>
     </div>
   </div>
@@ -67,8 +83,10 @@
     </div>
   </div>
 
+  <div id="budget-advisory"></div>
+
   <div class="alert alert-info" style="margin-top:0.25rem;">
-    <strong>Gợi ý thực tế:</strong> Nếu huấn luyện đầy đủ ước tính dưới ~1 giờ và bạn chỉ cần chạy 1 lần, có thể dùng thẳng cấu hình chuẩn; khi muốn cân bằng tốt nhất giữa <strong>Độ chính xác – Thời gian – VRAM</strong> hoặc huấn luyện dài, hãy dùng chế độ tìm kiếm tự động.
+    <strong>Gợi ý thực tế:</strong> Nếu huấn luyện đầy đủ ước tính dưới ~1 giờ và bạn chỉ cần chạy 1 lần, có thể dùng thẳng cấu hình chuẩn; khi muốn cân bằng tốt nhất giữa <strong>Độ chính xác – Thời gian – VRAM</strong> hoặc huấn luyện dài, hãy dùng tìm kiếm tự động với trọng số <span class="mono">.pt</span> có sẵn.
   </div>
 
   <details class="advanced-box">
@@ -102,7 +120,7 @@
         </div>
         <div>
           <label for="launch-seeds">Danh sách Training Seeds</label>
-          <input id="launch-seeds" type="text" value="17 29 43" />
+          <input id="launch-seeds" type="text" value="17 29" />
         </div>
         <div>
           <label for="launch-weights">Trọng số mục tiêu (Chất lượng · Thời gian · VRAM)</label>
