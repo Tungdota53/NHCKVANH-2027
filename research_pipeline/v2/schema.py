@@ -8,9 +8,22 @@ import statistics
 from yolo_tuner.research import Objective, digest, nondominated
 
 TASKS = {"detection", "classification", "captioning"}
-METRICS = {"detection": "best validation mAP50-95 within declared horizon",
+DETECTION_METRICS = {
+    "map50": "best validation mAP50 within declared horizon",
+    "map50_95": "best validation mAP50-95 within declared horizon",
+}
+METRICS = {"detection": DETECTION_METRICS["map50"],
            "classification": "final epoch validation accuracy",
            "captioning": "best validation generated (BLEU4+chrF)/200 within declared horizon"}
+
+
+def detection_metric_for(protocol):
+    if protocol.get("task") != "detection":
+        return None
+    if "detection_metric" in protocol:
+        return protocol["detection_metric"]
+    definition = str(protocol.get("quality_definition") or "")
+    return "map50_95" if "mAP50-95" in definition else "map50"
 
 
 def config_id(config):
@@ -29,6 +42,11 @@ def validate_protocol(p):
         raise ValueError("Not a v2 protocol")
     if p["task"] not in TASKS:
         raise ValueError("Unsupported research task")
+    if "detection_metric" in p:
+        if p["task"] != "detection" or p["detection_metric"] not in DETECTION_METRICS:
+            raise ValueError("Invalid detection_metric for protocol task")
+        if p.get("quality_definition") != DETECTION_METRICS[p["detection_metric"]]:
+            raise ValueError("quality_definition does not match locked detection_metric")
     seeds = p["training_seeds"]
     if not seeds or any(type(s) is not int for s in seeds) or len(set(seeds)) != len(seeds):
         raise ValueError("Required training seeds must be distinct integers")
@@ -40,8 +58,11 @@ def validate_protocol(p):
     if p["scheduler"]["cost_margin"] < 1 or not 0 <= p["scheduler"]["probe_fraction"] <= 0.5:
         raise ValueError("Invalid scheduler margin/probe fraction")
     positive(p["scheduler"]["cleanup_seconds"], "cleanup_seconds")
-    if "policy_version" in p["scheduler"] and (type(p["scheduler"]["policy_version"]) is not int or p["scheduler"]["policy_version"] not in {1, 2}):
+    if "policy_version" in p["scheduler"] and (type(p["scheduler"]["policy_version"]) is not int or p["scheduler"]["policy_version"] not in {1, 2, 3}):
         raise ValueError("Unknown scheduler policy version")
+    if "memory_risk_margin" in p["scheduler"]:
+        if positive(p["scheduler"]["memory_risk_margin"], "memory_risk_margin") < 1:
+            raise ValueError("Invalid scheduler memory_risk_margin")
     Objective(**p["objective"])
     if not p["configs"] or len(p["config_ids"]) != len(p["configs"]) or len(set(p["config_ids"])) != len(p["configs"]):
         raise ValueError("Empty/duplicate candidate space")
@@ -52,13 +73,11 @@ def validate_protocol(p):
         if p["selection_rule"] not in RULES:
             raise ValueError("Unknown selection rule")
     from .scheduler import ADAPTIVE_METHODS
-    if p.get("method") in ADAPTIVE_METHODS and p.get("selection_rule", "weighted") != "weighted":
-        raise ValueError("adaptive_full acquisition currently supports weighted objective only; use baseline methods for other rules")
     if p.get("method") in ADAPTIVE_METHODS and "acquisition" not in p:
         raise ValueError("Adaptive method needs a locked acquisition specification")
     if "acquisition" in p:
         spec = p["acquisition"]
-        if spec.get("version") != 1:
+        if type(spec.get("version")) is not int or spec.get("version") not in {1, 2}:
             raise ValueError("Unknown acquisition policy")
         for key in ("kernel_ridge", "length_scale"):
             positive(spec[key], key)
@@ -66,6 +85,15 @@ def validate_protocol(p):
             value = spec[key]
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"{key} must be finite and nonnegative")
+        if "kernel" in spec and spec["kernel"] not in {"auto", "matern52", "rbf"}:
+            raise ValueError("Acquisition kernel must be auto, matern52, or rbf")
+        for grid_key in ("length_scale_grid", "ridge_grid"):
+            if grid_key in spec:
+                grid = spec[grid_key]
+                if not isinstance(grid, (list, tuple)) or not grid:
+                    raise ValueError(f"{grid_key} must be non-empty")
+                for v in grid:
+                    positive(v, grid_key)
     if "rungs" in p["scheduler"]:
         rungs = p["scheduler"]["rungs"]
         if not rungs or any(type(e) is not int or not 1 <= e <= p["full_epochs"] for e in rungs) or sorted(set(rungs)) != rungs:

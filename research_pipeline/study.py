@@ -180,15 +180,18 @@ def study(args, manifest=None):
                   for p in sorted((folder / sub).rglob("*")) if p.is_file()}
     memory = args.max_memory if args.max_memory is not None else (hw.get("vram_free_mb") or hw["ram_available_mb"]) * 0.8
     objective = Objective(args.objective, args.min_quality, args.max_time, memory, args.time_scale, args.memory_scale, tuple(args.weights))
+    det_metric = getattr(args, "detection_metric", "map50")
+    metric_label = "mAP50" if det_metric == "map50" else "mAP50-95"
     protocol = {"schema_version": 2, "adapter": "yolo_research", "task": "detection",
-                "implementation_version": "0.6.1", "require_optimizer_evidence": True,
+                "implementation_version": "0.11.0", "require_optimizer_evidence": True,
+                "primary_metric": det_metric,
                 "mode": "online_verification" if args.command == "verify-config" else "independent_research",
                 "dataset_source": manifest["source"], "dataset_sha256": digest(manifest), "subset_sha256": digest(sampled),
                 "hardware": hw, "configs": configs, "training_seeds": args.seeds, "split_seed": args.split_seed,
                 "full_epochs": args.full_epochs, "rungs": args.rungs, "methods": args.methods,
                 "search_budget_seconds": args.search_budget * 60, "trial_timeout": args.trial_timeout,
                 "timeout_seconds": args.timeout_hours * 3600, "objective": asdict(objective),
-                "quality_definition": "best validation mAP50-95 checkpoint within fixed full horizon",
+                "quality_definition": f"best validation {metric_label} checkpoint within fixed full horizon",
                 "memory_definition": "CUDA peak reserved allocator MiB; CPU/MPS process RSS MiB, not VRAM",
                 "source_files": sources(), "model_files": {c["model"]: sha(c["model"]) for c in configs}, "data_files": data_files,
                 "runtime_versions": runtime(), "common_setup_seconds": clock.elapsed,
@@ -218,7 +221,8 @@ def evaluate(folder, protocol, manifest, index, epochs, seconds, seed, location,
     data = manifest if full else sampled
     runner = DetectionRunner(location, folder / ("dataset.json" if full else "subset.json"),
                              folder / ("full_data" if full else "subset_data") / "data.yaml", protocol["hardware"],
-                             protocol["full_epochs"], seed, data["counts"], manifest["counts"])
+                             protocol["full_epochs"], seed, data["counts"], manifest["counts"],
+                             detection_metric=protocol.get("primary_metric", "map50_95"))
     print(f"{location.name} c{index:02d} seed{seed} epochs{epochs} full={full}", flush=True)
     result = runner.run(protocol["configs"][index], epochs, min(seconds, protocol["trial_timeout"]), "train" if full else "search")
     print(f"  {result['status']} | Q={result.get('best_quality')} | time={result['worker_wall_seconds']:.2f}s | memory={result.get('memory_mb')}", flush=True)

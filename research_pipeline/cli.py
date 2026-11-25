@@ -28,6 +28,7 @@ def parser():
             elif action.dest == "grid":
                 action.help = "JSON configuration overrides; detection also supports model/imgsz/batch/precision/accumulation/optimizer/lr0/weight_decay"
         child.add_argument("--models", nargs="+", help="Detection: installed architecture YAML or local checkpoint; no implicit weight downloads")
+        child.add_argument("--detection-metric", choices=["map50", "map50_95"], default="map50", help="Detection primary validation metric (default: map50)")
         child.add_argument("--prepare-only", action="store_true", help="Detection: freeze protocol/export data without training; start with research-start")
         child.add_argument("--allow-contention", action="store_true", help="Detection smoke only: permit competing ML jobs; never certify measurements/selection")
     start = commands.add_parser("research-start", help="Start a never-executed frozen detection protocol once hardware is idle")
@@ -208,7 +209,8 @@ def train(args, selection):
     write_json(output / "dataset.json", manifest)
     from yolo_tuner.adapters import export_yolo
     data = export_yolo(manifest, output / "data")
-    runner = DetectionRunner(output, output / "dataset.json", data, hw, epochs, selection["seed"], manifest["counts"], manifest["counts"])
+    runner = DetectionRunner(output, output / "dataset.json", data, hw, epochs, selection["seed"], manifest["counts"], manifest["counts"],
+                             detection_metric=report["protocol"].get("primary_metric", "map50_95"))
     print(f"Full training: {epochs} epochs | optimality scope changes: {changes}", flush=True)
     result = runner.run(config, epochs, args.timeout_hours * 3600, "train")
     write_json(output / "training_report.json", {"result": result, "selection": selection, "scope_changes": changes,

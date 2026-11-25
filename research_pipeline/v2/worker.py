@@ -145,6 +145,12 @@ def execute(req, output):
                     and observed["image_shapes"] == [[config["imgsz"], config["imgsz"]]]
                     and accumulation.get("max_images_per_update") == expected_effective
                     and raw.get("data_loader", {}).get("verified") is True)
+    if task == "detection":
+        expected_det_metric = req.get("detection_metric", "map50")
+        observed["checkpoint_selection_metric"] = raw.get("primary_metric")
+        checkpoint_epoch_ok = (req["mode"] != "train") or (raw.get("best_checkpoint_epoch") == raw.get("best_epoch"))
+        observed["checkpoint_epoch_verified"] = checkpoint_epoch_ok
+        verified = verified and raw.get("primary_metric") == expected_det_metric and checkpoint_epoch_ok
     if task == "detection" and "freeze" in config:
         actual["freeze"] = observed.get("freeze")
         verified = verified and actual["freeze"] == config["freeze"] and observed.get("freeze_blocks_verified") is True and observed.get("trainable_parameters", 0) > 0

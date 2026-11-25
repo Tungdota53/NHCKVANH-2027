@@ -5,6 +5,7 @@ import hashlib
 import math
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -13,6 +14,21 @@ import time
 import unicodedata
 
 from . import __version__
+
+_NO_COLOR = False
+_VT_INITIALIZED = False
+_ANSI_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+_SGR = {
+    "plain": "",
+    "bold": "\x1b[1m",
+    "muted": "\x1b[2m",
+    "success": "\x1b[1;32m",
+    "info": "\x1b[1;36m",
+    "warn": "\x1b[1;33m",
+    "danger": "\x1b[1;31m",
+    "accent": "\x1b[1;35m",
+}
 
 PHASES = {"preparing": "Đang chuẩn bị", "prepared": "Đã lập kế hoạch, chưa chạy",
           "search": "Đang tìm kiếm (trạng thái lưu)", "complete": "Đã kết thúc",
@@ -25,17 +41,51 @@ VERDICTS = {
 }
 
 
+def set_no_color(enabled: bool):
+    global _NO_COLOR
+    _NO_COLOR = bool(enabled)
+
+
+def color_enabled(stream=None) -> bool:
+    global _VT_INITIALIZED
+    stream = stream or sys.stdout
+    if _NO_COLOR or os.environ.get("NO_COLOR", "") != "" or os.environ.get("TERM", "").lower() == "dumb":
+        return False
+    isatty = getattr(stream, "isatty", None)
+    if not callable(isatty) or not isatty():
+        return False
+    if os.name == "nt" and not _VT_INITIALIZED:
+        try:
+            import colorama
+            colorama.just_fix_windows_console()
+        except Exception:
+            pass
+        _VT_INITIALIZED = True
+    return True
+
+
+def _supports_utf8(stream=None) -> bool:
+    stream = stream or sys.stdout
+    encoding = (getattr(stream, "encoding", None) or "utf-8").lower()
+    return "utf" in encoding
+
+
 def interactive():
     return bool(sys.stdin.isatty() and sys.stdout.isatty())
 
 
+def _is_safe_printable(c: str) -> bool:
+    return c >= " " and not ("\x7f" <= c <= "\x9f")
+
+
 def clean(value):
     # File names and worker errors are data, not terminal control instructions.
-    return "".join(c if c >= " " and c != "\x7f" else " " for c in str(value))
+    return "".join(c if _is_safe_printable(c) else " " for c in str(value))
 
 
 def width(value):
-    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(value))
+    visible = _ANSI_SGR_RE.sub("", str(value))
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in visible)
 
 
 def clip(value, limit):
@@ -50,9 +100,36 @@ def clip(value, limit):
     return result + "." * min(3, limit)
 
 
-def say(value="", *, file=None):
+def style_text(text, tone="plain", *, stream=None):
+    sanitized = clean(text)
+    prefix = _SGR.get(tone, "")
+    if not prefix or not color_enabled(stream):
+        return sanitized
+    return f"{prefix}{sanitized}\x1b[0m"
+
+
+def badge(label, tone="info", *, stream=None):
+    tag = f"[{clean(label)}]"
+    return style_text(tag, tone, stream=stream)
+
+
+def _write_line(value="", *, file=None, allow_sgr=False):
     stream = file or sys.stdout
-    value = "".join(c for c in str(value) if c in "\n\t" or c >= " " and c != "\x7f")
+    raw = str(value)
+    if allow_sgr and color_enabled(stream):
+        # Preserve only explicit SGR sequences (\x1b[...m); strip any other control chars.
+        parts = []
+        pos = 0
+        for m in _ANSI_SGR_RE.finditer(raw):
+            seg = "".join(c for c in raw[pos:m.start()] if c in "\n\t" or _is_safe_printable(c))
+            parts.append(seg)
+            parts.append(m.group(0))
+            pos = m.end()
+        parts.append("".join(c for c in raw[pos:] if c in "\n\t" or _is_safe_printable(c)))
+        value = "".join(parts)
+    else:
+        plain = _ANSI_SGR_RE.sub("", raw) if allow_sgr else raw
+        value = "".join(c for c in plain if c in "\n\t" or _is_safe_printable(c))
     encoding = getattr(stream, "encoding", None) or "utf-8"
     try:
         value.encode(encoding)
@@ -62,20 +139,29 @@ def say(value="", *, file=None):
     print(value, file=stream, flush=True)
 
 
+def say(value="", *, file=None):
+    _write_line(value, file=file, allow_sgr=False)
+
+
+def _say_styled(value="", *, file=None):
+    _write_line(value, file=file, allow_sgr=True)
+
+
 def title(label, note=None):
     columns = max(20, min(88, shutil.get_terminal_size((88, 24)).columns))
-    say("\n" + "=" * columns)
-    say(clip(label, columns))
+    rule_char = "─" if _supports_utf8() else "="
+    _say_styled("\n" + style_text(rule_char * columns, "muted"))
+    _say_styled(style_text(clip(label, columns), "bold"))
     if note:
         say(note)
-    say("=" * columns)
+    _say_styled(style_text(rule_char * columns, "muted"))
 
 
 def pairs(rows):
     size = min(24, max((width(k) for k, _ in rows), default=0))
     for key, value in rows:
         label = clean(key)
-        say(f"  {label}{' ' * max(0, size - width(label))} : {clean(value)}")
+        _say_styled(f"  {style_text(label, 'muted')}{' ' * max(0, size - width(label))} : {clean(value)}")
 
 
 def duration(seconds):
@@ -111,14 +197,79 @@ def read_json(path, *, optional=False):
         raise
 
 
+def _verdict_badge(verdict):
+    mapping = {
+        "empirical_optimal_in_declared_space": ("EMPIRICAL OPTIMAL", "success"),
+        "fully_trained_best_observed": ("BEST OBSERVED", "info"),
+        "no_verified_feasible_selection": ("NO FEASIBLE", "warn"),
+        "contended_smoke_not_certified": ("CONTENDED", "danger"),
+    }
+    label, tone = mapping.get(verdict, (str(verdict).upper(), "info"))
+    return badge(label, tone)
+
+
+def _candidate_status(row):
+    runs = row.get("runs") or []
+    has_oom = any(run.get("status") == "oom" for run in runs)
+    has_timeout = any(run.get("status") == "timeout" for run in runs)
+    if has_oom and has_timeout:
+        return "OOM/TIMEOUT", "danger"
+    if has_oom:
+        return "OOM", "danger"
+    if has_timeout:
+        return "TIMEOUT", "danger"
+    state = row.get("state")
+    if state == "confirmed_feasible":
+        return "OK", "success"
+    if state in {"infeasible", "confirmed_constraint_failure", "observed_required_seed_oom"}:
+        return ("OOM", "danger") if state == "observed_required_seed_oom" else ("FAIL", "danger")
+    if row.get("completed_seeds"):
+        return "PARTIAL", "warn"
+    return "UNRES", "muted"
+
+
+def _render_table(headers, rows, *, right_align=None):
+    right_align = set(right_align or ())
+    utf8 = _supports_utf8()
+    widths = [max([width(h)] + [width(r[i]) for r in rows]) for i, h in enumerate(headers)]
+
+    def pad(cell, col_idx):
+        text = str(cell)
+        gap = max(0, widths[col_idx] - width(text))
+        return (" " * gap + text) if col_idx in right_align else (text + " " * gap)
+
+    if utf8:
+        top = "  ┌" + "┬".join("─" * (w + 2) for w in widths) + "┐"
+        mid = "  ├" + "┼".join("─" * (w + 2) for w in widths) + "┤"
+        bot = "  └" + "┴".join("─" * (w + 2) for w in widths) + "┘"
+        sep = " │ "
+        left, right = "  │ ", " │"
+    else:
+        top = "  +" + "+".join("-" * (w + 2) for w in widths) + "+"
+        mid = top
+        bot = top
+        sep = " | "
+        left, right = "  | ", " |"
+
+    _say_styled(style_text(top, "muted"))
+    head_cells = [style_text(pad(h, i), "bold") for i, h in enumerate(headers)]
+    _say_styled(left + sep.join(head_cells) + right)
+    _say_styled(style_text(mid, "muted"))
+    for row in rows:
+        _say_styled(left + sep.join(pad(cell, i) for i, cell in enumerate(row)) + right)
+    _say_styled(style_text(bot, "muted"))
+
+
 def hardware_view(hw):
+    ready_badge = badge("READY", "success") if hw.get("ml_runtime_ready") else badge("NOT READY", "danger")
     pairs([("Thiết bị", hw.get("gpu") or hw.get("device", "chưa rõ")),
-           ("ML runtime", "Sẵn sàng" if hw.get("ml_runtime_ready") else "CHƯA SẴN SÀNG"),
+           ("ML runtime", f"{'Sẵn sàng' if hw.get('ml_runtime_ready') else 'CHƯA SẴN SÀNG'}"),
            ("RAM còn trống", number(hw.get("ram_available_mb"), 0) + " MiB"),
            ("VRAM còn trống", number(hw.get("vram_free_mb"), 0) + " MiB" if hw.get("vram_free_mb") is not None else "Không áp dụng / chưa đọc được"),
            ("Precision hỗ trợ", "FP32" + (", FP16" if hw.get("fp16") else "") + (", BF16" if hw.get("bf16") else ""))])
+    _say_styled("  Trạng thái runtime: " + ready_badge)
     if hw.get("reason"):
-        say("  Lý do: " + clean(hw["reason"]))
+        _say_styled("  Lý do: " + style_text(hw["reason"], "warn"))
 
 
 def inspection_view(info):
@@ -133,18 +284,90 @@ def inspection_view(info):
                ("Validation độc lập", "Có" if data.get("validation_ready") else "KHÔNG — cần sửa trước khi tối ưu")])
         if data.get("task") == "captioning" and data.get("captions"):
             say("  Caption train / val / test: " + " / ".join(str(data["captions"].get(s, "?")) for s in ("train", "val", "test")))
+        audit = data.get("audit")
+        if isinstance(audit, dict):
+            intra = audit.get("intra_split_duplicates") or {}
+            leak = audit.get("cross_split_leakage") or {}
+            pairs([("Trùng lặp nội bộ (SHA-256)", intra.get("total_duplicate_files", 0)),
+                   ("Rò rỉ giữa train/val/test", "CÓ — CẦN SỬA" if leak.get("has_leakage") else "Không (0)")])
+            if data.get("task") == "detection":
+                issues = sum((audit.get(k) or {}).get("count", 0) for k in ("missing_labels", "empty_labels", "malformed_labels", "out_of_bounds_boxes", "degenerate_boxes", "invalid_class_ids"))
+                imb = audit.get("imbalance_ratio")
+                imb_str = f"{imb:.2f}x" if isinstance(imb, (int, float)) else "có lớp = 0"
+                pairs([("Vấn đề nhãn/bbox", issues), ("Tỷ lệ mất cân bằng lớp", imb_str)])
         for warning in data.get("warnings") or []:
-            say("  Lưu ý: " + clean(warning))
+            _say_styled("  Lưu ý: " + style_text(warning, "warn"))
 
 
 def summary_view(folder, protocol, report):
     verdict = report["decision"]["verification_status"]
     title("KẾT QUẢ TÌM CẤU HÌNH", VERDICTS.get(verdict, verdict))
+    _say_styled("  Trạng thái chứng nhận: " + _verdict_badge(verdict))
     rows = report.get("candidates", [])
     complete = sum(len(r.get("completed_seeds", [])) for r in rows)
     expected = len(protocol["configs"]) * len(protocol["training_seeds"])
     say(f"  Full training hoàn tất: {complete}/{expected} lượt config × seed; {protocol['full_epochs']} epoch/lượt.")
     say("  Chỉ tối ưu theo objective, tập cấu hình, dữ liệu và máy đã khóa; không bảo đảm mọi GPU/dataset.")
+    from .schema import detection_metric_for
+    det_metric = detection_metric_for(protocol)
+    det_label = "Val mAP50" if det_metric == "map50" else "Val mAP50-95"
+    metric = {"detection": det_label, "classification": "Val accuracy", "captioning": "Val (BLEU4+chrF)/200"}.get(protocol["task"], "Validation")
+
+    if rows:
+        selected_idx = report["decision"].get("selected_index")
+        pareto_ids = set(report["decision"].get("pareto") or [])
+        val_col = det_label if protocol.get("task") == "detection" else ("Val Acc" if protocol.get("task") == "classification" else "Val Qual")
+        table_rows = []
+        for row in rows:
+            cfg = row.get("config") or {}
+            cid = str(row.get("config_id") or f"c{row.get('index', 0):02d}")[:8]
+            model_name = clip(Path(str(cfg.get("model", "?"))).name, 14)
+            img_b = f"{cfg.get('imgsz', '?')}/{cfg.get('batch', '?')}"
+            lr_val = cfg.get("lr0")
+            lr_str = f"{lr_val:g}" if isinstance(lr_val, (int, float)) else "-"
+            req_seeds = row.get("required_seeds") or protocol.get("training_seeds") or []
+            comp_seeds = row.get("completed_seeds") or []
+            seeds_str = f"{len(comp_seeds)}/{len(req_seeds)}"
+            st_label, st_tone = _candidate_status(row)
+            st_cell = style_text(st_label, st_tone)
+            q_mean = row.get("quality_mean")
+            q_str = f"{q_mean:.4f}" if isinstance(q_mean, (int, float)) and math.isfinite(q_mean) else "-"
+            t_mean = row.get("time_mean")
+            t_str = f"{t_mean:.1f}s" if isinstance(t_mean, (int, float)) and math.isfinite(t_mean) else "-"
+            m_max = row.get("memory_max")
+            m_str = f"{m_max:.0f}M" if isinstance(m_max, (int, float)) and math.isfinite(m_max) else "-"
+            u_val = row.get("utility")
+            u_str = f"{u_val:.4f}" if isinstance(u_val, (int, float)) and math.isfinite(u_val) else "-"
+            is_sel = row.get("index") == selected_idx
+            is_par = row.get("config_id") in pareto_ids
+            if is_sel and is_par:
+                tag = style_text("★ Pareto", "success")
+            elif is_sel:
+                tag = style_text("★", "success")
+            elif is_par:
+                tag = style_text("Pareto", "info")
+            else:
+                tag = ""
+            table_rows.append([
+                f"c{int(row.get('index', 0)):02d} {cid}",
+                model_name,
+                img_b,
+                lr_str,
+                seeds_str,
+                st_cell,
+                q_str,
+                t_str,
+                m_str,
+                u_str,
+                tag,
+            ])
+        say("\nBảng ứng viên:")
+        _render_table(
+            ["Cfg", "Model", "Img/B", "LR", "Seeds", "Status", val_col, "Time", "Mem", "U", "Tag"],
+            table_rows,
+            right_align={2, 3, 4, 6, 7, 8, 9},
+        )
+
     r = report.get("recommendation")
     if r:
         c = r["config"]
@@ -162,11 +385,18 @@ def summary_view(folder, protocol, report):
             pairs([("Quy tắc đã khóa", report["selection_rule"]), ("Điểm theo quy tắc", number(r.get("selection_score"), 6))])
             if report.get("selection_fallback"):
                 say("  Fallback công bố: " + report["selection_fallback"])
-        metric = {"detection": "Val mAP50-95", "classification": "Val accuracy", "captioning": "Val (BLEU4+chrF)/200"}.get(protocol["task"], "Validation")
         sd = f" ± SD {number(r.get('validation_sd_not_ci'))}" if len(r["completed_seeds"]) > 1 else " (1 seed; chưa ước lượng biến thiên)"
         memory_label = "VRAM reserved đo được" if r["memory_kind"] == "cuda_reserved_allocator_mib" else "RAM RSS cây tiến trình"
         pairs([(metric, number(r["validation_mean"]) + sd), ("Thời gian / full lượt", duration(r["full_worker_seconds_mean"])),
                (memory_label, number(r["memory_max_mb"], 1) + " MiB"), ("Điểm cân bằng U", number(r["utility"], 6))])
+        chosen_id = report["decision"].get("selected_config_id")
+        det_diag = (report.get("detection_diagnostics") or {}).get(chosen_id or "")
+        if det_diag:
+            pairs([("Tại best epoch (phụ)",
+                    f"mAP50-95={number(det_diag['map50_95_at_best']['mean'])} | "
+                    f"P={number(det_diag['precision_at_best']['mean'])} | "
+                    f"R={number(det_diag['recall_at_best']['mean'])} | "
+                    f"F1={number(det_diag['f1_at_best']['mean'])}")])
         say("  SD không phải khoảng tin cậy; thời gian trên không phải toàn bộ chi phí search.")
     else:
         say("  Không thay kết quả full training thiếu bằng số đo probe hoặc cấu hình chưa xác minh.")
@@ -241,12 +471,26 @@ def status_view(path):
         last = history[-1]
         evaluation = read_json(Path(last["output"]) / "evaluation.json", optional=True) or {}
         say("\nTest sau lựa chọn (không dùng chọn cấu hình)")
-        pairs([("Trạng thái / seed", f"{last.get('status')} / {last.get('seed')}"), ("Số lần mở test", len(history))])
-        for metric in ("map50_95", "map50", "accuracy", "bleu4", "chrf"):
-            if metric in evaluation:
-                pairs([(metric, number(evaluation[metric]))])
+        seeds_str = str(evaluation.get("evaluated_seeds") or last.get("seed"))
+        pairs([("Trạng thái / seeds", f"{last.get('status')} / {seeds_str}"), ("Số lần mở test", len(history))])
+        summary = evaluation.get("multi_seed_summary") or {}
+        if summary:
+            for metric in ("map50", "map75", "map50_95", "precision", "recall", "f1", "accuracy", "bleu4", "chrf"):
+                if metric in summary and summary[metric].get("mean") is not None:
+                    m = summary[metric]
+                    sd_part = f" ± SD {number(m['sd'])}" if m.get("sd") is not None and m.get("n", 0) > 1 else ""
+                    pairs([(f"Test {metric} (mean)", number(m["mean"]) + sd_part)])
+        else:
+            for metric in ("map50", "map75", "map50_95", "precision", "recall", "f1", "accuracy", "bleu4", "chrf"):
+                if metric in evaluation:
+                    pairs([(metric, number(evaluation[metric]))])
+        lat = evaluation.get("latency") or {}
+        if isinstance(lat, dict) and lat.get("available") and isinstance(lat.get("total_ms_per_image"), dict):
+            ms = lat["total_ms_per_image"].get("mean")
+            fps = (lat.get("fps") or {}).get("mean")
+            pairs([("Inference Latency (rect=False)", f"{number(ms, 2)} ms/ảnh ({number(fps, 1)} FPS | {lat.get('precision', 'fp32')} | batch={lat.get('batch_size')})")])
         say(f"  Báo cáo: {Path(last['output']) / 'EVALUATION.md'}")
-        say("  Đây không phải test trung bình nhiều seed hoặc bằng chứng dataset hoàn toàn chưa từng được xem.")
+        say("  Kết quả test độc lập quá trình chọn cấu hình; lịch sử mở test đã được khóa.")
     else:
         say("\n  Test: chưa có lịch sử đánh giá sau lựa chọn; không tự động mở test.")
     say("\nKiểm tra chứng cứ gốc:")
@@ -300,14 +544,15 @@ def runs_view(entries):
     if not entries:
         say("  Chưa tìm thấy protocol hoặc báo cáo training.")
     for i, row in enumerate(entries, 1):
-        say(f"  [{i}] {row['task']} | {row['kind']} | {PHASES.get(row['phase'], row['phase'])}")
+        phase_text = PHASES.get(row["phase"], row["phase"])
+        _say_styled(f"  [{i}] {style_text(row['task'], 'bold')} | {style_text(row['kind'], 'info')} | {phase_text}")
         say("      " + row["path"])
 
 
 def error_view(exc):
     message = str(exc)
     title("KHÔNG THỂ HOÀN THÀNH LỆNH")
-    say("  Lý do: " + clean(message), file=sys.stderr)
+    _say_styled("  " + badge("ERROR", "danger", stream=sys.stderr) + " Lý do: " + clean(message), file=sys.stderr)
     lower = message.lower()
     if getattr(exc, "hint", None):
         hint = exc.hint
@@ -334,13 +579,48 @@ def error_view(exc):
     say("  Cách xử lý: " + hint, file=sys.stderr)
 
 
+def _read_gpu_temp(device):
+    if device is None:
+        return None
+    dev = str(device).strip().lower()
+    if not dev or dev in {"cpu", "mps"}:
+        return None
+    try:
+        import pynvml
+        idx = 0
+        if dev.startswith("cuda:"):
+            idx = int(dev.split(":", 1)[1])
+        elif dev.isdigit():
+            idx = int(dev)
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+        return float(pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU))
+    except Exception:
+        return None
+
+
+def _progress_bar(current, total, width_chars=10):
+    total_val = max(1, int(total or 1))
+    ratio = min(1.0, max(0.0, float(current or 0) / total_val))
+    filled = int(round(ratio * width_chars))
+    if _supports_utf8():
+        return "[" + "█" * filled + "░" * (width_chars - filled) + "]"
+    return "[" + "#" * filled + "-" * (width_chars - filled) + "]"
+
+
 class TrialProgress:
     """Throttled append-only epoch updates, also readable in redirected logs."""
 
-    def __init__(self, folder, index, seed, epochs, full, config, seconds):
-        self.folder, self.epochs = Path(folder), epochs
+    def __init__(self, folder, index, seed, epochs, full, config, seconds, *, budget_remaining_fn=None, device=None, detection_metric=None):
+        self.folder, self.index, self.seed, self.epochs = Path(folder), int(index), seed, int(epochs)
+        self.full, self.seconds = bool(full), float(seconds)
+        self.budget_remaining_fn = budget_remaining_fn
+        self.device = device
+        self.detection_metric = detection_metric
         self.started, self.last, self.epoch = time.monotonic(), -20.0, -1
-        self.label = f"c{index:02d} / seed {seed} / {'FULL' if full else 'PROBE'}"
+        self._last_temp_at, self._cached_temp = -60.0, None
+        self.mode_tag = "FULL" if full else "PROBE"
+        self.label = f"c{self.index:02d} / seed {seed} / {self.mode_tag}"
         say(f"\n  Bắt đầu {self.label}: {Path(config['model']).name}, ảnh {config['imgsz']}, batch {config['batch']}, {config['precision']}")
         say(f"  {epochs} epoch | trần thời gian lượt này: {duration(seconds)} | Ctrl+C: dừng an toàn")
         say(f"  Log: {self.folder / 'worker.log'}")
@@ -351,9 +631,39 @@ class TrialProgress:
         epoch = result.get("epochs_completed", 0)
         if epoch != self.epoch or now - self.last >= 20:
             self.epoch, self.last = epoch, now
-            metric = result.get("quality")
-            detail = " | Q=" + number(metric) if metric is not None else " | đang khởi tạo / xử lý batch" if not epoch else ""
-            say(f"    {self.label} | epoch {epoch}/{self.epochs} | đã chạy {duration(now)}{detail}")
+            bar = _progress_bar(epoch, self.epochs)
+            if callable(self.budget_remaining_fn):
+                try:
+                    rem_seconds = max(0.0, float(self.budget_remaining_fn()))
+                except Exception:
+                    rem_seconds = max(0.0, self.seconds - now)
+            else:
+                rem_seconds = max(0.0, self.seconds - now)
+            metric_val = result.get("quality_score")
+            if metric_val is None:
+                metric_val = result.get("quality")
+            if metric_val is None:
+                metric_val = result.get("best_quality")
+            primary = self.detection_metric or result.get("primary_metric")
+            val_label = "Val mAP50" if primary == "map50" else "Val mAP50-95" if primary == "map50_95" else "Val"
+            val_str = number(metric_val) if metric_val is not None else "chưa đo"
+            mem_val = result.get("memory_mb")
+            if mem_val is None:
+                mem_val = result.get("peak_reserved_mb")
+            if mem_val is None:
+                mem_val = result.get("peak_rss_mb")
+            mem_str = f"{number(mem_val, 1)} MiB" if mem_val is not None else "N/A"
+            if now - self._last_temp_at >= 5.0 or self._cached_temp is None:
+                self._cached_temp = _read_gpu_temp(self.device)
+                self._last_temp_at = now
+            temp_str = f"{self._cached_temp:.0f}°C" if self._cached_temp is not None else "N/A"
+            mode_styled = style_text(self.mode_tag, "info" if self.full else "warn")
+            line = (
+                f"    [Config c{self.index:02d} | Seed {self.seed} | {mode_styled} | "
+                f"epoch {epoch}/{self.epochs} | {bar} | Budget {duration(rem_seconds)} | "
+                f"{val_label} {val_str} | VRAM {mem_str} | GPU Temp {temp_str}]"
+            )
+            _say_styled(line)
 
 
 def wait_worker(process, seconds, progress=None):

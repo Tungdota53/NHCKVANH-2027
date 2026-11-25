@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Tạo &amp; Chạy thực nghiệm mới</h1>
+    <div class="subtitle">Giao diện tối giản: chỉ cần chọn dữ liệu, trọng số và ngân sách thời gian. Tùy chọn nghiên cứu sâu nằm gọn trong mục nâng cao.</div>
+  </div>
+</div>
+
+<div id="launcher-form" class="card">
+  <h2>1. Chọn bộ dữ liệu &amp; Kiểm tra chống rò rỉ (Chỉ đọc)</h2>
+  <div class="form-row">
+    <div>
+      <label for="launch-dataset-select">Bộ dữ liệu có sẵn (runs/datasets/)</label>
+      <select id="launch-dataset-select"></select>
+    </div>
+    <div>
+      <label for="launch-data">Đường dẫn dữ liệu (YAML / thư mục / JSON)</label>
+      <input id="launch-data" type="text" placeholder="runs/datasets/african_wildlife_benchmark/data.yaml" />
+    </div>
+    <div>
+      <label for="launch-device">Thiết bị chạy (auto = tự chọn GPU)</label>
+      <input id="launch-device" type="text" value="auto" />
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap;margin-bottom:0.75rem;">
+    <button id="btn-inspect-dataset" type="button" class="btn btn-primary">Kiểm tra dữ liệu (Chống rò rỉ)</button>
+    <span class="subtitle" style="margin:0;">Quét ảnh trùng SHA-256 giữa train/val/test và độ mất cân bằng lớp trước khi chạy.</span>
+  </div>
+  <div id="inspect-result"></div>
+</div>
+
+<div class="card">
+  <h2>2. Cài đặt cơ bản — Chỉ cần chọn 4 mục</h2>
+  <div class="form-row">
+    <div>
+      <label for="launch-mode">Chế độ chạy</label>
+      <select id="launch-mode">
+        <option value="optimize">Tối ưu tìm cấu hình (optimize)</option>
+        <option value="plan-search">Chỉ lập kế hoạch không chạy (plan-search)</option>
+        <option value="benchmark">Đối chứng nhiều thuật toán (benchmark)</option>
+      </select>
+    </div>
+    <div>
+      <label for="launch-models">Trọng số khởi tạo (.pt có sẵn)</label>
+      <select id="launch-models"></select>
+    </div>
+    <div>
+      <label for="launch-epochs">Số epoch đầy đủ</label>
+      <input id="launch-epochs" type="number" min="1" value="10" />
+    </div>
+    <div>
+      <label for="launch-budget">Ngân sách tìm kiếm (giây)</label>
+      <input id="launch-budget" type="number" min="10" value="300" />
+      <div class="pill-row">
+        <button type="button" class="pill-btn budget-preset-btn" data-budget="180">Nhanh 3 phút</button>
+        <button type="button" class="pill-btn budget-preset-btn" data-budget="300">Chuẩn 5 phút</button>
+        <button type="button" class="pill-btn budget-preset-btn" data-budget="900">NCKH 15 phút</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="form-row">
+    <div>
+      <label for="launch-output">Tên thư mục lưu kết quả (trong runs/)</label>
+      <input id="launch-output" type="text" value="ui_launch" />
+    </div>
+  </div>
+
+  <div class="alert alert-info" style="margin-top:0.25rem;">
+    <strong>Gợi ý thực tế:</strong> Nếu huấn luyện đầy đủ ước tính dưới ~1 giờ và bạn chỉ cần chạy 1 lần, có thể dùng thẳng cấu hình chuẩn; khi muốn cân bằng tốt nhất giữa <strong>Độ chính xác – Thời gian – VRAM</strong> hoặc huấn luyện dài, hãy dùng chế độ tìm kiếm tự động.
+  </div>
+
+  <details class="advanced-box">
+    <summary>Cài đặt nâng cao (Không gian cấu hình, Thuật toán, Quy tắc chọn, Seeds, Trọng số mục tiêu)</summary>
+    <div class="advanced-body">
+      <div class="form-row">
+        <div>
+          <label for="launch-space">Không gian cấu hình</label>
+          <select id="launch-space">
+            <option value="core">Cơ bản (core · 12 cấu hình)</option>
+            <option value="compact">Gọn nhẹ (compact · 3 cấu hình)</option>
+            <option value="research">Nghiên cứu (research · lưới kiểm soát)</option>
+          </select>
+        </div>
+        <div>
+          <label for="launch-method">Thuật toán tìm kiếm</label>
+          <select id="launch-method"></select>
+        </div>
+        <div>
+          <label for="launch-rule">Quy tắc chọn cấu hình cuối</label>
+          <select id="launch-rule"></select>
+        </div>
+      </div>
+      <div class="form-row" style="margin-bottom:0;">
+        <div>
+          <label for="launch-metric">Chỉ số chính (Detection)</label>
+          <select id="launch-metric">
+            <option value="map50">mAP50 (IoU=0.50 · Chuẩn NCKH)</option>
+            <option value="map50_95">mAP50-95</option>
+          </select>
+        </div>
+        <div>
+          <label for="launch-seeds">Danh sách Training Seeds</label>
+          <input id="launch-seeds" type="text" value="17 29 43" />
+        </div>
+        <div>
+          <label for="launch-weights">Trọng số mục tiêu (Chất lượng · Thời gian · VRAM)</label>
+          <input id="launch-weights" type="text" value="0.6 0.25 0.15" />
+        </div>
+      </div>
+    </div>
+  </details>
+</div>
+
+<div class="card">
+  <h2>3. Xem lệnh CLI tương đương &amp; Xác nhận chạy</h2>
+  <pre id="cli-preview" class="log-box" style="max-height:110px;"></pre>
+  <div style="display:flex;align-items:center;gap:0.75rem;margin-top:0.85rem;flex-wrap:wrap;">
+    <label style="display:flex;align-items:center;gap:0.45rem;margin:0;cursor:pointer;">
+      <input id="launch-confirm-check" type="checkbox" />
+      <span>Tôi xác nhận khởi chạy tiến trình chính thức <span class="mono">research_pipeline.v2</span>.</span>
+    </label>
+    <button id="btn-launch-job" type="button" class="btn btn-primary">Bắt đầu chạy</button>
+  </div>
+  <div id="launch-result" style="margin-top:0.8rem;"></div>
+</div>
+{% endblock %}

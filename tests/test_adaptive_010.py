@@ -207,7 +207,7 @@ class AdaptiveAcquisitionTests(unittest.TestCase):
     def test_spec_validation_and_prelocked_parameter_values(self):
         p = self.protocol()
         self.assertEqual(acquisition_spec(p), p["acquisition"])
-        for key, value in (("version", 2), ("kernel_ridge", 0), ("length_scale", -1),
+        for key, value in (("version", 99), ("kernel_ridge", 0), ("length_scale", -1),
                            ("exploration", float("nan")), ("novelty_weight", True)):
             changed = copy.deepcopy(p)
             changed["acquisition"][key] = value

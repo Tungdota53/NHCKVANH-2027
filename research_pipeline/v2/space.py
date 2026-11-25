@@ -10,6 +10,8 @@ from .file_integrity import content_hash
 from yolo_tuner.research import digest
 from .schema import TASKS
 
+OPTIONAL_DETECTION_KEYS = ("cos_lr", "warmup_epochs", "mosaic", "close_mosaic")
+
 
 def canonical(config):
     c = dict(config)
@@ -37,6 +39,8 @@ def validate_config(task, c, hw):
         if isinstance(c[key], bool) or not isinstance(c[key], (float, int)) or not math.isfinite(c[key]) or c[key] < 0 or key == "lr0" and c[key] == 0:
             raise ValueError(f"Invalid {key}")
     if task != "detection":
+        if any(key in c for key in OPTIONAL_DETECTION_KEYS):
+            raise ValueError("Detection schedule/augmentation keys are unsupported for non-detection tasks")
         if task == "classification" and c["model"] != "cnn_classifier":
             raise ValueError("Classification adapter currently supports cnn_classifier only")
         for key in (("width", "hidden") if task == "captioning" else ("width",)):
@@ -54,8 +58,23 @@ def validate_config(task, c, hw):
                 raise ValueError("feature_grid must be an integer in 1..16")
     elif type(c.get("freeze", 0)) is not int or c.get("freeze", 0) < 0:
         raise ValueError("freeze must be a nonnegative number of backbone blocks")
-    elif c.get("freeze", 0) and not str(c["model"]).endswith(".pt"):
+    elif c.get("freeze", 0) and not str(c["model"]).lower().endswith(".pt"):
         raise ValueError("Freeze requires a local learned .pt checkpoint, not an untrained YAML architecture")
+    else:
+        if "cos_lr" in c and type(c["cos_lr"]) is not bool:
+            raise ValueError("cos_lr must be a bool")
+        if "warmup_epochs" in c:
+            v = c["warmup_epochs"]
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
+                raise ValueError("warmup_epochs must be a finite number >= 0")
+        if "mosaic" in c:
+            v = c["mosaic"]
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= 1:
+                raise ValueError("mosaic must be a finite number in [0, 1]")
+        if "close_mosaic" in c:
+            v = c["close_mosaic"]
+            if type(v) is not int or v < 0:
+                raise ValueError("close_mosaic must be a nonnegative integer")
 
 
 def build_space(task, hw, folder, grid=None, preset="compact", models=None, precision=None):
@@ -83,13 +102,20 @@ def build_space(task, hw, folder, grid=None, preset="compact", models=None, prec
         batches = (4, 8) if task == "detection" else (8, 16)
         overrides = []
         for model, size, batch, lr in itertools.product(choices, sizes, batches, (0.001, 0.0003)):
-            freezes = (0, 5) if task == "detection" and str(model).endswith(".pt") else (0,)
+            freezes = (0, 5) if task == "detection" and str(model).lower().endswith(".pt") else (0,)
             for freeze in freezes:
                 c = {"model": model, "imgsz": size, "batch": batch, "lr0": lr,
-                     "accumulation": base["batch"] * base["accumulation"] // batch}
+                     "accumulation": max(1, base["batch"] * base["accumulation"] // batch)}
                 if task == "detection":
                     c["freeze"] = freeze
                 overrides.append(c)
+        if task == "detection":
+            overrides += [
+                {"model": choices[0], "cos_lr": True},
+                {"model": choices[0], "warmup_epochs": 3.0},
+                {"model": choices[0], "mosaic": 0.5, "close_mosaic": 5},
+                {"model": choices[0], "mosaic": 0.0, "close_mosaic": 0},
+            ]
     elif preset == "core":
         # 12 configs: baseline + controlled contrasts, not all cross-products.
         overrides = [{}]
@@ -98,7 +124,12 @@ def build_space(task, hw, folder, grid=None, preset="compact", models=None, prec
         sizes = (224, 480, 640) if task == "detection" else (48, 64, 96) if task == "classification" else (96, 224, 256)
         overrides += [{"imgsz": s} for s in sizes]
         if task == "detection":
-            overrides += [{"model": (models or ["yolo11n.yaml", "yolo11s.yaml"])[-1]}, {"optimizer": "SGD"}, {"weight_decay": 0.001}]
+            model_choices = list(models) if models else ["yolo11n.yaml", "yolo11s.yaml"]
+            overrides += [{"model": m} for m in model_choices[1:]]
+            pt_models = [m for m in model_choices if str(m).lower().endswith(".pt")]
+            if pt_models:
+                overrides.append({"model": pt_models[0], "freeze": 5})
+            overrides += [{"optimizer": "SGD"}, {"weight_decay": 0.001}]
         else:
             overrides += [{"width": 32}, {"width": 64}, {"hidden": 512} if task == "captioning" else {"lr0": 0.0001}]
         # Effective-batch contrasts use the baseline's nominal effective batch.
@@ -107,7 +138,8 @@ def build_space(task, hw, folder, grid=None, preset="compact", models=None, prec
                 c["accumulation"] = max(1, base["batch"] * base["accumulation"] // c["batch"])
     else:
         overrides = [{}, {"lr0": 0.0003}, {"lr0": 0.003}]
-    if not isinstance(overrides, list) or not overrides or len(overrides) > 512 or any(not isinstance(c, dict) or set(c) - set(base) for c in overrides):
+    allowed_keys = set(base) | (set(OPTIONAL_DETECTION_KEYS) if task == "detection" else set())
+    if not isinstance(overrides, list) or not overrides or len(overrides) > 512 or any(not isinstance(c, dict) or set(c) - allowed_keys for c in overrides):
         raise ValueError("Grid must contain 1..512 supported task-specific overrides")
     configs, identities, snapshots = [], set(), {}
     for override in overrides:

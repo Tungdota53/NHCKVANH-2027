@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="vi" data-theme="light">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="csrf-token" content="{{ csrf_token }}" />
+  <title>{{ page_title }} — NCKH Studio</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body data-page="{{ active_page }}">
+  <header class="topbar">
+    <div class="brand">
+      <span>NCKH Studio</span>
+      <span class="brand-tag">v{{ version }} · Chạy nội bộ 100%</span>
+    </div>
+    <nav class="nav" aria-label="Điều hướng chính">
+      <a href="/" class="{{ 'active' if active_page == 'overview' else '' }}">Tổng quan</a>
+      <a href="/monitor" class="{{ 'active' if active_page == 'monitor' else '' }}">Theo dõi</a>
+      <a href="/launcher" class="{{ 'active' if active_page == 'launcher' else '' }}">Chạy mới</a>
+      <a href="/analysis" class="{{ 'active' if active_page == 'analysis' else '' }}">Phân tích</a>
+      <a href="/benchmark" class="{{ 'active' if active_page == 'benchmark' else '' }}">Đối chứng</a>
+      <a href="/export" class="{{ 'active' if active_page == 'export' else '' }}">Xuất NCKH</a>
+    </nav>
+    <div class="actions-bar">
+      <button id="theme-toggle" type="button" class="btn">Giao diện tối</button>
+    </div>
+  </header>
+
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="footer">
+    Giao diện nội bộ an toàn (127.0.0.1) · Thư mục kết quả: <span class="mono">{{ runs_dir }}</span> · Chỉ đọc trên bằng chứng lịch sử
+  </footer>
+
+  <script src="/static/charts.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

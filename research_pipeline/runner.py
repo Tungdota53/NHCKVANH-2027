@@ -15,8 +15,19 @@ def actual_matches(config, actual):
     exact = ("batch", "imgsz", "precision", "accumulation", "optimizer")
     if any(actual.get(k) != config[k] for k in exact):
         return False
-    return all(abs(actual.get(k, float("inf")) - config[k]) <= max(1e-12, abs(config[k]) * 1e-6)
-               for k in ("lr0", "weight_decay"))
+    if not all(abs(actual.get(k, float("inf")) - config[k]) <= max(1e-12, abs(config[k]) * 1e-6)
+               for k in ("lr0", "weight_decay")):
+        return False
+    if "cos_lr" in config and actual.get("cos_lr") is not config["cos_lr"]:
+        return False
+    if "close_mosaic" in config and (type(actual.get("close_mosaic")) is not int or actual.get("close_mosaic") != config["close_mosaic"]):
+        return False
+    for k in ("warmup_epochs", "mosaic"):
+        if k in config:
+            val = actual.get(k)
+            if isinstance(val, bool) or not isinstance(val, (int, float)) or abs(float(val) - float(config[k])) > max(1e-6, abs(float(config[k])) * 1e-6):
+                return False
+    return True
 
 
 def training_evidence_complete(result):
@@ -24,12 +35,13 @@ def training_evidence_complete(result):
 
 
 class DetectionRunner:
-    def __init__(self, folder, manifest_path, data_yaml, hw, epochs, seed, counts, full_counts):
+    def __init__(self, folder, manifest_path, data_yaml, hw, epochs, seed, counts, full_counts, detection_metric="map50"):
         self.folder = Path(folder).resolve()
         self.folder.mkdir(parents=True, exist_ok=True)
         self.manifest_path, self.data_yaml = str(manifest_path), str(data_yaml)
         self.hw, self.epochs, self.seed = hw, epochs, seed
         self.counts, self.full_counts = counts, full_counts
+        self.detection_metric = detection_metric
 
     def run(self, config, epochs, seconds, mode="train"):
         index = max((int(p.name.split("_")[-1]) for p in self.folder.glob("trial_*")), default=0) + 1
@@ -38,7 +50,8 @@ class DetectionRunner:
         req = {"config": config, "mode": mode, "manifest": self.manifest_path, "data": self.data_yaml,
                "device": self.hw["device"], "full_epochs": self.epochs, "trial_epochs": epochs,
                "seed": self.seed, "project": str(folder), "resume": None,
-               "counts": self.counts, "full_counts": self.full_counts}
+               "counts": self.counts, "full_counts": self.full_counts,
+               "detection_metric": self.detection_metric}
         write_json(folder / "request.json", req)
         started = time.monotonic()
         with (folder / "worker.log").open("w", encoding="utf-8") as log:

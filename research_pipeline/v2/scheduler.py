@@ -7,10 +7,17 @@ import time
 from yolo_tuner.research import Objective
 from .predictors import CostModel
 from .model_features import descriptor_for, family_scale
-from .schema import complete, decision, measurements
+from .schema import complete, config_id, decision, measurements
 from .selection import select
 
-ADAPTIVE_METHODS = ("adaptive_full", "adaptive_no_cost", "adaptive_no_uncertainty", "adaptive_no_diversity")
+ADAPTIVE_METHODS = (
+    "adaptive_full",
+    "adaptive_ehvi",
+    "adaptive_staged_seeds",
+    "adaptive_no_cost",
+    "adaptive_no_uncertainty",
+    "adaptive_no_diversity",
+)
 METHODS = (*ADAPTIVE_METHODS, "reserve", "random", "default", "profile_all", "random_proxy", "quality_sh", "utility_sh", "no_reserve", "successive_halving", "prior_full")
 
 
@@ -44,6 +51,42 @@ def small_first_key(protocol, index):
     return (not known, size, config["imgsz"], config["batch"], family, scale)
 
 
+def _effective_memory_limit(objective, protocol):
+    """Return (limit_mb, limit_kind) from objective.max_memory or 0.98 * vram_free_mb fallback."""
+    if objective.max_memory is not None:
+        return float(objective.max_memory), "max_memory"
+    vram_free = protocol.get("hardware", {}).get("vram_free_mb")
+    if (isinstance(vram_free, (int, float)) and not isinstance(vram_free, bool)
+            and math.isfinite(vram_free) and vram_free > 0):
+        return float(vram_free) * 0.98, "vram_free"
+    return None, None
+
+
+def _memory_risk(forecast, objective, protocol, prior_runs=None):
+    """Classify predicted or observed memory risk relative to objective/VRAM limits."""
+    limit, limit_kind = _effective_memory_limit(objective, protocol)
+    if limit is not None and prior_runs:
+        obs_mems = [float(r["memory_mb"]) for r in prior_runs
+                    if r.get("mode") == "train" and r.get("status") == "ok"
+                    and isinstance(r.get("memory_mb"), (int, float)) and not isinstance(r.get("memory_mb"), bool)
+                    and math.isfinite(r["memory_mb"])]
+        if obs_mems and max(obs_mems) > limit:
+            risk_level = "observed_seed_exceeded_max_memory" if limit_kind == "max_memory" else "observed_seed_exceeded_vram_free"
+            return risk_level, limit, max(obs_mems)
+    pred_mb = forecast.get("predicted_memory_mb")
+    if pred_mb is None or isinstance(pred_mb, bool) or not isinstance(pred_mb, (int, float)) or not math.isfinite(pred_mb):
+        return "unknown", None, None
+    pred_mb = float(pred_mb)
+    risk_margin = float(protocol["scheduler"].get("memory_risk_margin", 1.10))
+    if limit is not None and pred_mb > limit:
+        risk_level = "hard_exceeds_max_memory" if limit_kind == "max_memory" else "hard_exceeds_vram_free"
+        return risk_level, limit, pred_mb
+    if limit is not None and pred_mb * risk_margin > limit:
+        risk_level = "soft_near_max_memory" if limit_kind == "max_memory" else "soft_near_vram_free"
+        return risk_level, limit, pred_mb
+    return "safe", limit, pred_mb
+
+
 def run_search(protocol, evaluate, remaining, ledger, initial=None, on_change=None, elapsed=None):
     """evaluate(index, seed, epochs, full, worker_seconds) has no oracle/test inputs."""
     configs, seeds = protocol["configs"], protocol["training_seeds"]
@@ -62,7 +105,8 @@ def run_search(protocol, evaluate, remaining, ledger, initial=None, on_change=No
         for result in state["probes"]:
             cost_model.update(result["index"], result)
     cleanup = protocol["scheduler"]["cleanup_seconds"]
-    protected = protocol["scheduler"].get("policy_version", 1) >= 2
+    policy_version = protocol["scheduler"].get("policy_version", 1)
+    protected = policy_version >= 2
     probe_spent = (state.get("probe_budget_spent_seconds", sum(r["worker_wall_seconds"] for r in state["probes"]))
                    if protected else sum(r["worker_wall_seconds"] for r in state["probes"]))
     order = list(state["ordering"])
@@ -123,6 +167,15 @@ def run_search(protocol, evaluate, remaining, ledger, initial=None, on_change=No
             cap = None
             if protected and (method == "successive_halving" or method in ADAPTIVE_METHODS):
                 forecast = cost_model.estimate(i)
+                if policy_version >= 3:
+                    risk_level, limit_mb, meas_mb = _memory_risk(forecast, objective, protocol, rows)
+                    if risk_level in {"hard_exceeds_max_memory", "hard_exceeds_vram_free", "observed_seed_exceeded_max_memory", "observed_seed_exceeded_vram_free"}:
+                        reason = ("observed seed memory exceeds effective memory limit; OOM/constraint risk guard"
+                                  if risk_level.startswith("observed_seed_")
+                                  else "predicted memory exceeds effective memory limit; OOM/constraint risk guard")
+                        ledger.emit("candidate_unresolved", index=i, reason=reason, risk_level=risk_level,
+                                    limit_mb=limit_mb, measured_or_predicted_mb=meas_mb, forecast=forecast)
+                        return
                 plan = forecast["planning_seconds"]
                 need = len(missing(i))
                 if plan is not None and plan * need + cleanup > remaining():
@@ -144,15 +197,64 @@ def run_search(protocol, evaluate, remaining, ledger, initial=None, on_change=No
         # low-fidelity quality rung. A timeout can be retried in a later resume,
         # but never in an unbounded loop during the same execution.
         attempted = set()
+        partial_deferred = set()
+        emitted_memory_deferred = {d["index"] for d in state.get("memory_risk_deferred", []) if isinstance(d, dict) and "index" in d}
         history = state.setdefault("acquisition_history", [])
+        acq_mode = "ehvi" if method == "adaptive_ehvi" else "auto"
+
+        def _is_competitive(chosen_idx, result, rows_now):
+            sel = select(rows_now, protocol)
+            best_idx = sel.get("selected_index")
+            if best_idx is None:
+                return True
+            best_row = rows_now[best_idx]
+            seed1_row = {
+                "quality_mean": result["quality"],
+                "quality_min": result["quality"],
+                "time_mean": result["worker_wall_seconds"],
+                "time_max": result["worker_wall_seconds"],
+                "memory_max": result["memory_mb"],
+            }
+            if not objective.feasible(seed1_row):
+                return False
+            inc_u = best_row["utility"]
+            inc_q = best_row["quality_mean"]
+            inc_sd = best_row.get("quality_sd") or 0.0
+            seed1_u = objective.value(seed1_row)
+            rule = protocol.get("selection_rule", "weighted")
+            if rule == "weighted":
+                return (seed1_u >= inc_u - max(0.02, 0.05 * abs(inc_u))) or (result["quality"] >= inc_q - max(0.05, 2.0 * inc_sd))
+            if objective.min_quality > 0 and result["quality"] < max(0.0, objective.min_quality - 0.05):
+                return False
+            return ((seed1_u >= inc_u - 0.03)
+                    or (result["quality"] >= inc_q - max(0.05, 2.0 * inc_sd))
+                    or (result["worker_wall_seconds"] < best_row["time_mean"] * 0.90)
+                    or (result["memory_mb"] < best_row["memory_max"] * 0.90))
+
         while remaining() > cleanup:
             rows = measurements(configs, state["results"], seeds, protocol["full_epochs"], objective)
-            eligible, deferred = [], []
+            has_complete_incumbent = any(row["complete"] for row in rows)
+            eligible, deferred, memory_deferred = [], [], []
             forecasts = {i: cost_model.estimate(i) for i in range(len(configs))}
             for i in order:
                 prior = state["results"][str(i)]
                 if i in attempted or not missing(i) or any(r.get("status") in {"oom", "config_mismatch", "training_evidence_missing"} for r in prior):
                     continue
+                if policy_version >= 3:
+                    risk_level, limit_mb, meas_mb = _memory_risk(forecasts[i], objective, protocol, prior)
+                    if risk_level in {"hard_exceeds_max_memory", "hard_exceeds_vram_free", "observed_seed_exceeded_max_memory", "observed_seed_exceeded_vram_free"}:
+                        rec = {
+                            "index": i, "config_id": config_id(configs[i]),
+                            "predicted_memory_mb": meas_mb, "max_memory_mb": limit_mb,
+                            "risk_level": risk_level, "memory_basis": forecasts[i].get("memory_basis"),
+                            "upper_bound_guaranteed": False,
+                        }
+                        memory_deferred.append(rec)
+                        if i not in emitted_memory_deferred:
+                            emitted_memory_deferred.add(i)
+                            state.setdefault("memory_risk_deferred", []).append(rec)
+                            ledger.emit("candidate_memory_risk_deferred", **rec)
+                        continue
                 plan = forecasts[i]["planning_seconds"]
                 censored = [r["worker_wall_seconds"] for r in prior if r.get("status") == "timeout" and r.get("worker_wall_seconds", 0) > 0]
                 if censored:
@@ -164,13 +266,150 @@ def run_search(protocol, evaluate, remaining, ledger, initial=None, on_change=No
                                     "timeout_lower_bound_seconds": lower,
                                     "basis": forecasts[i]["basis"] + "; observed timeout lower bound, not completed full cost"}
                     plan = forecasts[i]["planning_seconds"]
-                if plan is not None and plan * len(missing(i)) + cleanup > remaining():
+                has_done_seed = any(complete(r, protocol["full_epochs"]) for r in prior)
+                need_count = 1 if (method == "adaptive_staged_seeds" and has_complete_incumbent and not has_done_seed and len(missing(i)) >= 2) else len(missing(i))
+                if plan is not None and plan * need_count + cleanup > remaining():
                     deferred.append(i)
                     continue
                 eligible.append({"index": i, "missing_seeds": missing(i)})
             if not eligible:
-                ledger.emit("adaptive_stopped", reason="no remaining all-seed action has affordable forecast", deferred=deferred, upper_bound_guaranteed=False)
+                stop_kwargs = {"reason": "no remaining all-seed action has affordable forecast", "deferred": deferred, "upper_bound_guaranteed": False}
+                if policy_version >= 3:
+                    stop_kwargs["deferred_memory_risk"] = [d["index"] for d in memory_deferred]
+                ledger.emit("adaptive_stopped", **stop_kwargs)
                 break
+            if policy_version >= 3:
+                safe_eligible = [c for c in eligible if _memory_risk(forecasts[c["index"]], objective, protocol, state["results"][str(c["index"])])[0] in {"safe", "unknown"}]
+                candidates_for_acq = safe_eligible if safe_eligible else eligible
+            else:
+                candidates_for_acq = eligible
+
+            if method == "adaptive_staged_seeds" and len(seeds) >= 2:
+                if not has_complete_incumbent:
+                    partial = [c for c in eligible if any(complete(r, protocol["full_epochs"]) for r in state["results"][str(c["index"])])]
+                    if partial:
+                        chosen = partial[0]["index"]
+                        acquisition = {"ranking": [c["index"] for c in partial], "scores": {},
+                                       "surrogate": {"reason": "finish partially confirmed configuration first; no proxy quality input"}}
+                        reason = "partial_confirmation_priority"
+                    else:
+                        chosen = min((c["index"] for c in candidates_for_acq), key=lambda i: (small_first_key(protocol, i), order.index(i)))
+                        acquisition = {"ranking": [chosen], "scores": {},
+                                       "surrogate": {"reason": "cold start; metadata-small first and equal-share unknown worker cap"}}
+                        reason = "bootstrap_full_confirmation"
+                    entry = {"step": len(history) + 1, "index": chosen, "reason": reason,
+                             "missing_seeds": missing(chosen), "remaining_seconds": remaining(),
+                             "deferred_unaffordable": deferred, **acquisition}
+                    if policy_version >= 3:
+                        entry["deferred_memory_risk"] = [d["index"] for d in memory_deferred]
+                    history.append(entry)
+                    ledger.emit("adaptive_acquisition", **entry)
+                    save()
+                    attempted.add(chosen)
+                    confirm(chosen)
+                    continue
+
+                active_partial = [c for c in eligible if c["index"] not in partial_deferred and any(complete(r, protocol["full_epochs"]) for r in state["results"][str(c["index"])])]
+                unstarted_acq = [c for c in candidates_for_acq if not any(complete(r, protocol["full_epochs"]) for r in state["results"][str(c["index"])])]
+                if active_partial:
+                    chosen = active_partial[0]["index"]
+                    acquisition = {"ranking": [c["index"] for c in active_partial], "scores": {},
+                                   "surrogate": {"reason": "finish partially confirmed configuration first; no proxy quality input"}}
+                    reason = "staged_seed_completion"
+                    entry = {"step": len(history) + 1, "index": chosen, "reason": reason,
+                             "missing_seeds": missing(chosen), "remaining_seconds": remaining(),
+                             "deferred_unaffordable": deferred, **acquisition}
+                    if policy_version >= 3:
+                        entry["deferred_memory_risk"] = [d["index"] for d in memory_deferred]
+                    history.append(entry)
+                    ledger.emit("adaptive_acquisition", **entry)
+                    save()
+                    attempted.add(chosen)
+                    confirm(chosen)
+                    continue
+
+                if unstarted_acq:
+                    acquisition = rank_candidates(protocol, rows, forecasts, candidates=unstarted_acq, order=order,
+                                                  use_cost=True, use_uncertainty=True, use_diversity=True,
+                                                  acquisition_mode=acq_mode)
+                    chosen = acquisition["ranking"][0]
+                    reason = "adaptive_staged_seed_1"
+                    entry = {"step": len(history) + 1, "index": chosen, "reason": reason,
+                             "missing_seeds": missing(chosen), "remaining_seconds": remaining(),
+                             "deferred_unaffordable": deferred, **acquisition}
+                    if policy_version >= 3:
+                        entry["deferred_memory_risk"] = [d["index"] for d in memory_deferred]
+                    history.append(entry)
+                    ledger.emit("adaptive_acquisition", **entry)
+                    save()
+
+                    fc_chosen = forecasts[chosen]
+                    cap = None
+                    if protected:
+                        if fc_chosen["planning_seconds"] is None:
+                            need = len(missing(chosen))
+                            cap = max(0, (remaining() - cleanup) / need)
+                            ledger.emit("candidate_cost_unavailable", index=chosen, reason="unknown full cost; equal-share bootstrap cap is heuristic, not a guarantee", worker_cap_seconds=cap)
+                    seed_1 = missing(chosen)[0]
+                    result = attempt(chosen, seed_1, True, cap)
+                    if result is None or not complete(result, protocol["full_epochs"]):
+                        attempted.add(chosen)
+                        continue
+                    updated_fc = cost_model.estimate(chosen)
+                    limit_mb, limit_kind = _effective_memory_limit(objective, protocol)
+                    obs_mem = result.get("memory_mb")
+                    violated_mem = (limit_mb is not None and isinstance(obs_mem, (int, float))
+                                    and not isinstance(obs_mem, bool) and math.isfinite(obs_mem) and float(obs_mem) > limit_mb)
+                    violated_time = objective.max_time is not None and result["worker_wall_seconds"] > objective.max_time
+                    if violated_mem or violated_time:
+                        ledger.emit("adaptive_staged_stopped_infeasible", index=chosen, seed=seed_1,
+                                    memory_mb=result["memory_mb"], worker_wall_seconds=result["worker_wall_seconds"],
+                                    memory_limit_mb=limit_mb, memory_limit_kind=limit_kind)
+                        attempted.add(chosen)
+                        continue
+                    need_rem = len(missing(chosen))
+                    plan_rem = updated_fc["planning_seconds"]
+                    if need_rem > 0 and plan_rem is not None and plan_rem * need_rem + cleanup > remaining():
+                        ledger.emit("adaptive_staged_deferred_unaffordable", index=chosen, remaining_seeds=need_rem,
+                                    planning_seconds=plan_rem, remaining_seconds=remaining())
+                        attempted.add(chosen)
+                        continue
+                    if not _is_competitive(chosen, result, rows) and len(unstarted_acq) > 1:
+                        partial_deferred.add(chosen)
+                        ledger.emit("adaptive_staged_deferred_weak", index=chosen, seed1_quality=result["quality"],
+                                    seed1_wall_seconds=result["worker_wall_seconds"], seed1_memory_mb=result["memory_mb"])
+                    else:
+                        attempted.add(chosen)
+                        confirm(chosen)
+                    continue
+
+                drain_pool = [c for c in eligible if c["index"] in partial_deferred]
+                if not drain_pool:
+                    drain_pool = eligible
+                def _seed1_utility(entry_c):
+                    idx = entry_c["index"]
+                    comp = [r for r in state["results"][str(idx)] if complete(r, protocol["full_epochs"])]
+                    if not comp:
+                        return (-math.inf, -idx)
+                    u = objective.value({"quality_mean": comp[0]["quality"], "time_mean": comp[0]["worker_wall_seconds"], "memory_max": comp[0]["memory_mb"]})
+                    return (u, -idx)
+                drain_sorted = sorted(drain_pool, key=_seed1_utility, reverse=True)
+                chosen = drain_sorted[0]["index"]
+                acquisition = {"ranking": [c["index"] for c in drain_sorted], "scores": {},
+                               "surrogate": {"reason": "drain deferred staged candidates with remaining budget"}}
+                reason = "staged_seed_drain_completion"
+                entry = {"step": len(history) + 1, "index": chosen, "reason": reason,
+                         "missing_seeds": missing(chosen), "remaining_seconds": remaining(),
+                         "deferred_unaffordable": deferred, **acquisition}
+                if policy_version >= 3:
+                    entry["deferred_memory_risk"] = [d["index"] for d in memory_deferred]
+                history.append(entry)
+                ledger.emit("adaptive_acquisition", **entry)
+                save()
+                attempted.add(chosen)
+                confirm(chosen)
+                continue
+
             # Preserve previous partial full-data investment before acquiring
             # another configuration. Failed/incomplete observations never fit Q.
             partial = [c for c in eligible if any(complete(r, protocol["full_epochs"]) for r in state["results"][str(c["index"])])]
@@ -179,23 +418,26 @@ def run_search(protocol, evaluate, remaining, ledger, initial=None, on_change=No
                 acquisition = {"ranking": [c["index"] for c in partial], "scores": {},
                                "surrogate": {"reason": "finish partially confirmed configuration first; no proxy quality input"}}
                 reason = "partial_confirmation_priority"
-            elif not any(row["complete"] for row in rows):
+            elif not has_complete_incumbent:
                 # Cold start needs one measured incumbent. Seed order breaks
                 # equal-metadata ties; no future validation/ref/table is read.
-                chosen = min((c["index"] for c in eligible), key=lambda i: (small_first_key(protocol, i), order.index(i)))
+                chosen = min((c["index"] for c in candidates_for_acq), key=lambda i: (small_first_key(protocol, i), order.index(i)))
                 acquisition = {"ranking": [chosen], "scores": {},
                                "surrogate": {"reason": "cold start; metadata-small first and equal-share unknown worker cap"}}
                 reason = "bootstrap_full_confirmation"
             else:
-                acquisition = rank_candidates(protocol, rows, forecasts, candidates=eligible, order=order,
+                acquisition = rank_candidates(protocol, rows, forecasts, candidates=candidates_for_acq, order=order,
                                               use_cost=method != "adaptive_no_cost",
                                               use_uncertainty=method != "adaptive_no_uncertainty",
-                                              use_diversity=method != "adaptive_no_diversity")
+                                              use_diversity=method != "adaptive_no_diversity",
+                                              acquisition_mode=acq_mode)
                 chosen = acquisition["ranking"][0]
                 reason = "adaptive_optimistic_acquisition"
             entry = {"step": len(history) + 1, "index": chosen, "reason": reason,
                      "missing_seeds": missing(chosen), "remaining_seconds": remaining(),
                      "deferred_unaffordable": deferred, **acquisition}
+            if policy_version >= 3:
+                entry["deferred_memory_risk"] = [d["index"] for d in memory_deferred]
             history.append(entry)
             ledger.emit("adaptive_acquisition", **entry)
             save()

@@ -3,13 +3,50 @@
 import json
 import sys
 from pathlib import Path
+import statistics
 
 from yolo_tuner.pipeline import write_json
 from yolo_tuner.research import Objective
-from .schema import measurements, decision, complete
+from .schema import detection_metric_for, measurements, decision, complete
 from .ledger import read_events, worker_cost
 from .terminal import summary_view
 from .selection import select, presets, rule_scores
+
+
+def _detection_diagnostics(protocol, rows):
+    seeds = set(protocol["training_seeds"])
+    epochs = protocol["full_epochs"]
+    details = {}
+    for row in rows:
+        valid = {r["seed"]: r for r in row["runs"] if r.get("seed") in seeds and complete(r, epochs)}
+        if not valid:
+            continue
+        runs = [valid[s] for s in sorted(valid)]
+        at_best = [r.get("at_best_epoch") or {} for r in runs]
+        def stat(values):
+            clean = [float(v) for v in values if isinstance(v, (int, float))]
+            if not clean:
+                return {"mean": None, "sd": None}
+            return {"mean": statistics.mean(clean), "sd": statistics.stdev(clean) if len(clean) > 1 else 0.0}
+        map50_vals = [b.get("map50", r.get("best_map50")) for b, r in zip(at_best, runs)]
+        map50_95_vals = [b.get("map50_95", r.get("best_map50_95")) for b, r in zip(at_best, runs)]
+        prec_vals = [b.get("precision", r.get("precision_proxy")) for b, r in zip(at_best, runs)]
+        rec_vals = [b.get("recall", r.get("recall_proxy")) for b, r in zip(at_best, runs)]
+        f1_vals = [b.get("f1", r.get("f1_proxy")) for b, r in zip(at_best, runs)]
+        best_epochs = [int(r["best_epoch"]) for r in runs if isinstance(r.get("best_epoch"), int)]
+        details[row["config_id"]] = {
+            "completed_seeds": sorted(valid),
+            "complete": len(valid) == len(seeds),
+            "map50_at_best": stat(map50_vals),
+            "map50_95_at_best": stat(map50_95_vals),
+            "precision_at_best": stat(prec_vals),
+            "recall_at_best": stat(rec_vals),
+            "f1_at_best": stat(f1_vals),
+            "best_epoch_mean": statistics.mean(best_epochs) if best_epochs else None,
+            "best_epoch_min": min(best_epochs) if best_epochs else None,
+            "best_epoch_max": max(best_epochs) if best_epochs else None,
+        }
+    return details
 
 
 def make_report(protocol, state, events):
@@ -92,22 +129,46 @@ def make_report(protocol, state, events):
                       acquisition_uses_full_confirmations_only=True, uncertainty_calibrated=False)
         report["limitations"] += ["Adaptive quality model uses complete full-data/all-seed outcomes only; optimism/novelty are heuristic, not statistical upper bounds.",
                                   "No early-quality pruning in adaptive_full does not guarantee exploration of every slow starter before budget exhaustion."]
+    if "detection_metric" in protocol:
+        report.update(detection_metric=protocol["detection_metric"],
+                      detection_diagnostics=_detection_diagnostics(protocol, rows))
+    if "memory_risk_deferred" in state:
+        report["memory_risk_deferred"] = state["memory_risk_deferred"]
     return report
 
 
 def markdown(report, protocol):
     def f(value):
         return "—" if value is None else f"{value:.5f}"
+    det_metric = detection_metric_for(protocol)
+    val_col = "Val mAP50 mean±SD" if det_metric == "map50" else "Val mAP50-95 mean±SD" if det_metric == "map50_95" else "Val mean±SD"
     lines = ["# Cấu hình huấn luyện — pipeline v2", "", f"Trạng thái: {report['decision']['verification_status']}",
              f"Dataset: {protocol['dataset_source']}", f"Hardware: {protocol['hardware'].get('gpu') or 'CPU'}; task={protocol['task']}; method={protocol['method']}.",
              f"Horizon={protocol['full_epochs']}; required seeds={protocol['training_seeds']}; shared budget={protocol['budget_seconds']}s.",
              f"Metric: {protocol['quality_definition']}. Bộ nhớ: {protocol['memory_kind']}.",
              f"Objective khóa trước: {protocol['objective']}", "", "## Tất cả ứng viên", "",
-             "| ID | Model | Image | Batch/accum | LR | Full seeds | State | Val mean±SD | Worker T(s) | M max(MiB) | U |",
+             f"| ID | Model | Image | Batch/accum | LR | Full seeds | State | {val_col} | Worker T(s) | M max(MiB) | U |",
              "|---|---|---:|---|---:|---|---|---:|---:|---:|---:|"]
     for r in report["candidates"]:
         c = r["config"]
         lines.append(f"| {r['config_id']} | {Path(c['model']).name} | {c['imgsz']} | {c['batch']}/{c['accumulation']} | {c['lr0']} | {len(r['completed_seeds'])}/{len(r['required_seeds'])} | {r['state']} | {f(r['quality_mean'])}±{f(r['quality_sd'])} | {f(r['time_mean'])} | {f(r['memory_max'])} | {f(r['utility'])} |")
+    if report.get("detection_diagnostics"):
+        lines += ["", "## Chỉ số chi tiết Object Detection tại Best Checkpoint", "",
+                  "Checkpoint `best.pt` được lưu theo đúng metric chính đã khóa (`" + str(report.get("detection_metric")) + "`). Các chỉ số phụ dưới đây là giá trị đo tại chính `best_epoch` của từng seed (không dùng để chọn lại cấu hình):", "",
+                  "| ID | Seeds | mAP50 mean±SD | mAP50-95 mean±SD | Precision mean | Recall mean | F1 mean | Best epoch (mean / min..max) |",
+                  "|---|---|---:|---:|---:|---:|---:|---|"]
+        for r in report["candidates"]:
+            diag = report["detection_diagnostics"].get(r["config_id"])
+            if not diag:
+                continue
+            ep_str = f"{diag['best_epoch_mean']:.1f} ({diag['best_epoch_min']}..{diag['best_epoch_max']})" if diag["best_epoch_mean"] is not None else "—"
+            lines.append(
+                f"| {r['config_id']} | {len(diag['completed_seeds'])}/{len(r['required_seeds'])} | "
+                f"{f(diag['map50_at_best']['mean'])}±{f(diag['map50_at_best']['sd'])} | "
+                f"{f(diag['map50_95_at_best']['mean'])}±{f(diag['map50_95_at_best']['sd'])} | "
+                f"{f(diag['precision_at_best']['mean'])} | {f(diag['recall_at_best']['mean'])} | "
+                f"{f(diag['f1_at_best']['mean'])} | {ep_str} |"
+            )
     lines += ["", "## Recommendation", "", "```json", json.dumps(report["recommendation"], ensure_ascii=False, indent=2), "```",
               "", f"Pareto: {report['decision']['pareto']}",
               f"Online session: {report['online_session_seconds']}s; budget overrun: {report['budget_overrun_seconds']}s; all worker attempts: {report['all_attempt_worker_seconds']}s; proxy workers: {report['proxy_worker_seconds']}s.",

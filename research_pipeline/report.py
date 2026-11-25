@@ -57,11 +57,13 @@ def summarize(protocol, decisions, results, elapsed, prior=None):
     selection_evidence = None
     if best:
         probes = [r for d in decisions for r in d["history"] if r["config_id"] == best["config_id"] and r["complete"] and not r["full_data"]]
+        det_metric = protocol.get("primary_metric")
         selection_evidence = {"config_id": best["config_id"], "config": protocol["configs"][int(best["config_id"][1:])],
                               "selection_origin": "full_online_confirmations" if online else "offline_full_reference_not_free_online_search",
                               "utility": objective.value(best), "runner_up": ranked[1]["config_id"] if len(ranked) > 1 else None,
                               "utility_margin": objective.value(best) - objective.value(ranked[1]) if len(ranked) > 1 else None,
-                              "validation_map50_95_mean": best["quality_mean"], "validation_map50_95_sd": best["quality_sd"],
+                              "validation_map50_95_mean": best["quality_mean"] if det_metric != "map50" else None,
+                              "validation_map50_95_sd": best["quality_sd"] if det_metric != "map50" else None,
                               "training_worker_seconds_mean": best["time_mean"], "measured_memory_mb": best["memory_max"],
                               "memory_kind": "CUDA peak reserved allocator" if protocol["hardware"]["device"] not in {"cpu", "mps"} else "process RSS; NOT VRAM",
                               "predicted_full_seconds": statistics.mean(r["estimated_time"] for r in probes) if probes else None,
@@ -71,6 +73,9 @@ def summarize(protocol, decisions, results, elapsed, prior=None):
                               "full_training_verification": "passed_observed_required_seeds" if clean else "smoke_only_contended",
                               "oom_in_chosen_full_runs": False,
                               "optimality_verification": verified, "seed_variation_not_confidence_interval": True}
+        if det_metric == "map50":
+            selection_evidence.update(primary_metric="map50", validation_map50_mean=best["quality_mean"],
+                                      validation_map50_sd=best["quality_sd"], test_map50=None)
     cost = sum(reference_cost(r) for rows in results.values() for r in rows)
     return {"schema_version": 3, "adapter": "yolo_research", "mode": protocol["mode"], "protocol": protocol,
             "decisions": decisions, "reference": reference, "reference_complete": complete,
@@ -92,10 +97,11 @@ def summarize(protocol, decisions, results, elapsed, prior=None):
 
 def markdown(report):
     p = report["protocol"]
+    metric_label = "mAP50" if p.get("primary_metric") == "map50" else "mAP50-95"
     lines = ["# Nghiên cứu lựa chọn cấu hình detection", "", f"Status: **{report['verification_status']}**.",
              f"Dataset: {p['dataset_source']}; device: {p['hardware'].get('gpu') or 'CPU'}.",
              f"Grid: {len(p['configs'])}; seeds: {p['training_seeds']}; horizon: {p['full_epochs']}epoch.",
-             f"Environment: {p['measurement_environment']}; validation metric: mAP50-95, not percent captions correct.",
+             f"Environment: {p['measurement_environment']}; validation metric: {metric_label}, not percent captions correct.",
              "U=wA*mean(A)-wT*mean(T)/Tref-wM*max(M)/Mref; parameters frozen before search.",
              f"Objective: {p['objective']}", "", "## Tất cả cấu hình và cơ sở lựa chọn", "",
              "| ID | Model | Image | Batch / accum | Precision | LR / decay | Full seeds | State | A mean±SD | T mean(s) | M max(MiB) | U |",

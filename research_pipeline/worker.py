@@ -24,8 +24,11 @@ def execute(req, output):
     os.environ["YOLO_AUTOINSTALL"] = "false"
     import psutil
     import torch
+    from unittest.mock import patch
     from ultralytics import YOLO, settings
     import ultralytics.engine.trainer as trainer_module
+    import ultralytics.models.yolo.detect.train as detect_train_module
+    from ultralytics.utils.metrics import Metric
     from ultralytics.utils.torch_utils import init_seeds
     from yolo_tuner.pipeline import write_json
     from .integrity import sha
@@ -33,6 +36,9 @@ def execute(req, output):
 
     settings.update({"sync": False})
     config = req["config"]
+    primary_metric = req.get("detection_metric", "map50")
+    if primary_metric not in {"map50", "map50_95"}:
+        raise ValueError(f"Unsupported detection_metric: {primary_metric}; expected 'map50' or 'map50_95'")
     cuda = req["device"] not in {"cpu", "mps"}
     if cuda:
         torch.cuda.set_device(int(req["device"]))
@@ -46,6 +52,8 @@ def execute(req, output):
     trainer_module.check_amp = lambda model: True
     init_seeds(req["seed"], deterministic=True)
     state = {"config": config, "status": "running", "epochs_completed": 0,
+             "primary_metric": primary_metric, "checkpoint_selection_metric": primary_metric,
+             "validation_rect": False,
              "memory_mb": 0.0, "peak_reserved_mb": 0.0, "peak_allocated_mb": 0.0,
              "peak_rss_mb": 0.0, "learning_curve": [], "mode": req["mode"],
              "precision_policy": "explicit frozen precision; no implicit AMP-download or fallback; finite metrics required",
@@ -71,6 +79,14 @@ def execute(req, output):
                            "optimizer": type(opt).__name__,
                            "lr0": float(opt.param_groups[0].get("initial_lr", trainer.args.lr0)),
                            "weight_decay": max(float(group["weight_decay"]) for group in opt.param_groups)}
+        if "cos_lr" in config:
+            state["actual"]["cos_lr"] = bool(trainer.args.cos_lr)
+        if "warmup_epochs" in config:
+            state["actual"]["warmup_epochs"] = float(trainer.args.warmup_epochs)
+        if "mosaic" in config:
+            state["actual"]["mosaic"] = float(trainer.args.mosaic)
+        if "close_mosaic" in config:
+            state["actual"]["close_mosaic"] = int(trainer.args.close_mosaic)
         state["actual_optimizer_groups"] = [{"lr": float(g["lr"]), "weight_decay": float(g["weight_decay"])} for g in opt.param_groups]
         if not actual_matches(config, state["actual"]):
             raise ValueError("Actual training parameters differ from the frozen configuration")
@@ -93,24 +109,52 @@ def execute(req, output):
     def batch_end(trainer):
         capture(trainer)
 
+    def model_saved(trainer):
+        if trainer.best_fitness == trainer.fitness and trainer.best.is_file():
+            state["best_checkpoint_epoch"] = int(trainer.epoch + 1)
+            state["best_checkpoint_fitness"] = float(trainer.fitness)
+
     def fit_end(trainer):
         capture(trainer)
         if not waiting[0]:
+            if req["mode"] == "train" and trainer.metrics:
+                fm50 = float(trainer.metrics.get("metrics/mAP50(B)", float("nan")))
+                fm95 = float(trainer.metrics.get("metrics/mAP50-95(B)", float("nan")))
+                fp = float(trainer.metrics.get("metrics/precision(B)", 0.0))
+                fr = float(trainer.metrics.get("metrics/recall(B)", 0.0))
+                if all(math.isfinite(v) and 0 <= v <= 1 for v in (fm50, fm95)):
+                    state["serialized_best_checkpoint_metrics"] = {
+                        "map50": fm50,
+                        "map50_95": fm95,
+                        "precision": fp if math.isfinite(fp) and 0 <= fp <= 1 else 0.0,
+                        "recall": fr if math.isfinite(fr) and 0 <= fr <= 1 else 0.0,
+                    }
             return  # library final best.pt validation, not another training epoch
         waiting[0] = False
         metrics = trainer.metrics or {}
-        q = float(metrics.get("metrics/mAP50-95(B)", float("nan")))
+        m50_95 = float(metrics.get("metrics/mAP50-95(B)", float("nan")))
         m50 = float(metrics.get("metrics/mAP50(B)", float("nan")))
-        if not all(math.isfinite(v) and 0 <= v <= 1 for v in (q, m50)):
-            raise ValueError("Detection validation lacks finite mAP50-95/mAP50")
+        prec = float(metrics.get("metrics/precision(B)", 0.0))
+        rec = float(metrics.get("metrics/recall(B)", 0.0))
+        if not all(math.isfinite(v) and 0 <= v <= 1 for v in (m50_95, m50)):
+            raise ValueError("Detection validation lacks finite mAP50/mAP50-95")
+        prec = prec if math.isfinite(prec) and 0 <= prec <= 1 else 0.0
+        rec = rec if math.isfinite(rec) and 0 <= rec <= 1 else 0.0
+        f1 = (2.0 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
         now = time.monotonic()
         timing.append((tick[1] - tick[0], now - tick[1]))
         state["epochs_completed"] = trainer.epoch + 1
-        state["learning_curve"].append({"epoch": state["epochs_completed"], "map50_95": q, "map50": m50})
-        best = max(state["learning_curve"], key=lambda r: (r["map50_95"], r["epoch"]))
-        state.update(quality_score=q, best_quality=best["map50_95"], best_epoch=best["epoch"],
-                     map50_95_proxy=q, map50_proxy=m50,
-                     best_map50_95=best["map50_95"], best_map50=best["map50"],
+        point = {"epoch": state["epochs_completed"], "map50": m50, "map50_95": m50_95,
+                 "precision": prec, "recall": rec, "f1": f1}
+        state["learning_curve"].append(point)
+        best = max(state["learning_curve"], key=lambda r: (r[primary_metric], r["epoch"]))
+        q = point[primary_metric]
+        state.update(quality_score=q, best_quality=best[primary_metric], best_epoch=best["epoch"],
+                     map50_95_proxy=m50_95, map50_proxy=m50,
+                     precision_proxy=prec, recall_proxy=rec, f1_proxy=f1,
+                     best_map50_95=max(r["map50_95"] for r in state["learning_curve"]),
+                     best_map50=max(r["map50"] for r in state["learning_curve"]),
+                     at_best_epoch=dict(best),
                      measured_loop_seconds=sum(t + v for t, v in timing))
         train_s, val_s = timing[-1]
         state["estimated_full_seconds"] = req["full_epochs"] * (
@@ -120,26 +164,49 @@ def execute(req, output):
         if req["mode"] == "search" and state["epochs_completed"] >= req["trial_epochs"]:
             raise ProxyComplete()
 
+    def fitness_for_metric(metric_self) -> float:
+        value = metric_self.map50 if primary_metric == "map50" else metric_self.map
+        return float(0.0 if value is None or not math.isfinite(float(value)) else value)
+
+    model_spec = str(config["model"])
+    if model_spec.lower().endswith(".pt") and not Path(model_spec).is_file():
+        raise ValueError(f"Local detection checkpoint not found (network downloads disabled): {model_spec}")
     model = YOLO(config["model"])
     if model.task != "detect":
         raise ValueError("Only YOLO detection is supported by this adapter")
     for event, callback in (("on_train_epoch_start", epoch_start), ("on_train_epoch_end", train_end),
-                            ("on_train_batch_end", batch_end), ("on_fit_epoch_end", fit_end)):
+                            ("on_train_batch_end", batch_end), ("on_model_save", model_saved),
+                            ("on_fit_epoch_end", fit_end)):
         model.add_callback(event, callback)
     kwargs = {"data": req["data"], "epochs": req["full_epochs"], "imgsz": config["imgsz"],
               "batch": config["batch"], "device": req["device"], "optimizer": config["optimizer"],
               "lr0": config["lr0"], "weight_decay": config["weight_decay"],
               "amp": False if config["precision"] == "fp32" else "bf16" if config["precision"] == "bf16" else True,
-              "nbs": config["batch"] * config["accumulation"], "warmup_epochs": 0.0,
+              "nbs": config["batch"] * config["accumulation"],
+              "cos_lr": bool(config.get("cos_lr", False)),
+              "warmup_epochs": float(config.get("warmup_epochs", 0.0)),
+              "mosaic": float(config.get("mosaic", 1.0)),
               "seed": req["seed"], "deterministic": True, "workers": 0, "cache": False,
               "patience": req["full_epochs"] + 1, "save": req["mode"] == "train", "val": True,
-              "close_mosaic": 0, "plots": False, "verbose": False, "project": req["project"],
-              "name": "training", "exist_ok": True, "pretrained": config["model"].endswith(".pt")}
+              "close_mosaic": int(config.get("close_mosaic", 0)),
+              "plots": False, "verbose": False, "project": req["project"],
+              "name": "training", "exist_ok": True, "pretrained": model_spec.lower().endswith(".pt")}
+    original_build_yolo_dataset = detect_train_module.build_yolo_dataset
+
+    def batch_invariant_yolo_dataset(*a, **kw):
+        if kw.get("mode") == "val":
+            kw["rect"] = False
+        return original_build_yolo_dataset(*a, **kw)
+
     try:
-        model.train(**kwargs)
+        with patch.object(Metric, "fitness", fitness_for_metric), \
+             patch.object(detect_train_module, "build_yolo_dataset", batch_invariant_yolo_dataset):
+            model.train(**kwargs)
         capture(model.trainer)
         if state["epochs_completed"] != req["full_epochs"]:
             raise ValueError("Training did not complete declared horizon")
+        if state.get("best_checkpoint_epoch") != state.get("best_epoch"):
+            raise ValueError("Saved best.pt epoch does not match declared primary detection metric optimum")
         best = Path(state["best_checkpoint"])
         state["checkpoint_sha256"] = sha(best)
         state["status"] = "ok"

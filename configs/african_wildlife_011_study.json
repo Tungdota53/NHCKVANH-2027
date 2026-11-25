@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "studies": [
+    {
+      "path": "../runs/african_wildlife_nckh_benchmark/20261118_173050_553132"
+    }
+  ],
+  "required_methods": ["adaptive_full", "random", "default"],
+  "bootstrap_seed": 2027,
+  "bootstrap_samples": 2000,
+  "confidence": 0.95
+}

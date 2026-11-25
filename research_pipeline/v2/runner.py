@@ -17,7 +17,7 @@ from research_pipeline.integrity import sha
 from .terminal import TrialProgress, wait_worker, say, duration, number
 
 
-def run_worker(folder, protocol, data, full, index, seed, epochs, seconds, ledger):
+def run_worker(folder, protocol, data, full, index, seed, epochs, seconds, ledger, *, budget_remaining_fn=None):
     folder.mkdir(parents=True, exist_ok=True)
     config = protocol["configs"][index]
     task = protocol["task"]
@@ -35,6 +35,8 @@ def run_worker(folder, protocol, data, full, index, seed, epochs, seconds, ledge
            "threads": min(4, protocol["hardware"].get("logical_cpus") or 1),
            "logical_cpus": protocol["hardware"].get("logical_cpus") or 1,
            "full_counts_by_source": {s: dict(Counter({})) for s in ("train", "val")}}
+    if "detection_metric" in protocol:
+        req["detection_metric"] = protocol["detection_metric"]
     if task == "captioning":
         from yolo_tuner.vision_worker import tokens
         common = Counter(" ".join(tokens(c)) for r in whole["splits"]["train"] for c in r["captions"])
@@ -47,7 +49,12 @@ def run_worker(folder, protocol, data, full, index, seed, epochs, seconds, ledge
             req["full_counts_by_source"][split] = dict(counts)
     write_json(folder / "request.json", req)
     ledger.emit("trial_started", attempt_id=req["attempt_id"], index=index, seed=seed, full=full, epochs=epochs, timeout_seconds=seconds)
-    progress = TrialProgress(folder, index, seed, epochs, full, config, seconds)
+    progress = TrialProgress(
+        folder, index, seed, epochs, full, config, seconds,
+        budget_remaining_fn=budget_remaining_fn,
+        device=(protocol.get("hardware") or {}).get("device"),
+        detection_metric=protocol.get("detection_metric"),
+    )
     start, timeout, interrupted = time.monotonic(), False, None
     env = {**os.environ, "CUBLAS_WORKSPACE_CONFIG": ":4096:8", "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
     with (folder / "worker.log").open("w", encoding="utf-8") as log:

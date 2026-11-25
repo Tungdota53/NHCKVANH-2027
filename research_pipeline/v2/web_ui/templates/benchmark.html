@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>So sánh &amp; Đối chứng thuật toán</h1>
+    <div class="subtitle">Đối chiếu U Regret, Quality Regret, tỷ lệ đạt Pareto, AUARC và kiểm định phi tham số ghép cặp giữa các thuật toán.</div>
+  </div>
+  <div>
+    <select id="benchmark-select" style="min-width:340px;"></select>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Biểu đồ so sánh sai lệch Regret theo thuật toán</h2>
+  <div class="subtitle" style="margin:-0.45rem 0 0.65rem 0;">Giá trị càng thấp (gần 0) chứng tỏ thuật toán tìm được cấu hình càng sát điểm tối ưu tham chiếu.</div>
+  <div id="chart-benchmark" class="chart-box"></div>
+</div>
+
+<div class="card">
+  <h2>Bảng tổng hợp hiệu năng theo phương pháp</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Thuật toán</th>
+          <th class="num">Số lượt N</th>
+          <th class="num">Tỷ lệ khả thi</th>
+          <th class="num">TB U Regret</th>
+          <th class="num">TB Quality Regret</th>
+          <th class="num">Đạt biên Pareto</th>
+          <th class="num">TB AUARC</th>
+          <th class="num">Thời gian Online TB</th>
+        </tr>
+      </thead>
+      <tbody id="bm-summaries-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Chi tiết từng Seed &amp; Kiểm định thống kê ghép cặp</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Phương pháp / Cặp so sánh</th>
+          <th class="num">Seed / N</th>
+          <th>Cấu hình / Wilcoxon</th>
+          <th class="num">U Regret / SignFlip</th>
+          <th class="num">Q Regret / Holm</th>
+          <th class="num">AUARC</th>
+          <th>Thời gian / Phạm vi hiệu lực</th>
+        </tr>
+      </thead>
+      <tbody id="bm-paired-body"></tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

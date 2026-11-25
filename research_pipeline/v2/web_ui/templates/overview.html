@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Tổng quan hệ thống</h1>
+    <div class="subtitle">Theo dõi phần cứng theo thời gian thực và quản lý các lượt chạy đã kiểm toán trong <span class="mono">{{ runs_dir }}</span>.</div>
+  </div>
+  <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
+    <a href="/launcher" class="btn btn-primary">+ Chạy thực nghiệm mới</a>
+    <button id="refresh-hw-btn" type="button" class="btn">Làm mới phần cứng</button>
+  </div>
+</div>
+
+<div class="card quick-steps-card">
+  <div class="quick-steps-title">Quy trình 3 bước dễ dùng</div>
+  <div class="quick-steps">
+    <a href="/launcher" class="quick-step">
+      <span class="step-num">1</span>
+      <div>
+        <strong>Chọn dữ liệu &amp; chạy tìm kiếm</strong>
+        <div class="subtitle">Kiểm tra rò rỉ dữ liệu, chọn ngân sách thời gian và bấm chạy.</div>
+      </div>
+    </a>
+    <a href="/analysis" class="quick-step">
+      <span class="step-num">2</span>
+      <div>
+        <strong>Xem cấu hình tối ưu &amp; Pareto</strong>
+        <div class="subtitle">So sánh mAP50, thời gian, VRAM và kết quả trên tập Test.</div>
+      </div>
+    </a>
+    <a href="/export" class="quick-step">
+      <span class="step-num">3</span>
+      <div>
+        <strong>Kiểm toán SHA-256 &amp; xuất báo cáo</strong>
+        <div class="subtitle">Xác minh tính toàn vẹn và tải bảng LaTeX, CSV, biểu đồ SVG.</div>
+      </div>
+    </a>
+  </div>
+</div>
+
+<div id="hw-cards" class="grid grid-4" style="margin-bottom:1rem;">
+  <div class="card"><div class="subtitle">Đang tải thông số phần cứng...</div></div>
+</div>
+
+<div class="card">
+  <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:0.75rem;margin-bottom:0.85rem;">
+    <h2 style="margin:0;">Lịch sử thực nghiệm &amp; Huấn luyện</h2>
+    <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
+      <input id="runs-filter" type="text" placeholder="Tìm theo đường dẫn, tác vụ, thuật toán..." style="width:280px;" />
+      <select id="runs-kind-filter" style="width:190px;">
+        <option value="all">Tất cả loại</option>
+        <option value="v2">Tìm kiếm v2</option>
+        <option value="v2_deployment">Huấn luyện triển khai v2</option>
+        <option value="research">Nghiên cứu v1</option>
+        <option value="legacy_training">Huấn luyện cũ</option>
+      </select>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Thư mục chạy</th>
+          <th>Loại</th>
+          <th>Tác vụ</th>
+          <th>Thuật toán</th>
+          <th>Trạng thái</th>
+          <th>Cấu hình chọn</th>
+          <th class="num">Chất lượng Val</th>
+          <th class="num">Độ hữu ích U</th>
+          <th>Thao tác</th>
+        </tr>
+      </thead>
+      <tbody id="runs-table-body">
+        <tr><td colspan="9" class="subtitle">Đang quét thư mục kết quả...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Báo cáo đối chứng thuật toán (Benchmark &amp; Study)</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Đường dẫn nghiên cứu</th>
+          <th>Loại</th>
+          <th>Tác vụ</th>
+          <th>Phương pháp / Phạm vi</th>
+          <th>Thao tác</th>
+        </tr>
+      </thead>
+      <tbody id="benchmarks-table-body">
+        <tr><td colspan="5" class="subtitle">Đang quét các bộ đối chứng...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

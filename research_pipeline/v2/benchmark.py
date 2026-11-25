@@ -11,7 +11,7 @@ from yolo_tuner.pipeline import new_session, write_json
 from yolo_tuner.research import digest
 from .workflow import audit_run, source_map, idle
 from .selection import select, rule_scores
-from .diagnostics import first_full_seconds, proxy_reference_diagnostics
+from .diagnostics import anytime_trajectory, first_full_seconds, proxy_reference_diagnostics
 from .ledger import read_events
 from . import __version__
 
@@ -48,8 +48,10 @@ def compare(runs, reference_path, allow_controller_patch=False):
     ref_complete = all(r["complete"] for r in reference)
     feasible = [r for r in reference if r["utility"] is not None]
     best = max(feasible, key=lambda r: r["utility"]) if feasible and ref_complete else None
+    best_quality_row = max(feasible, key=lambda r: r["quality_mean"]) if feasible and ref_complete else None
     scores, _ = rule_scores(reference, reference_protocol)
     reference_decision = select(reference, reference_protocol)
+    pareto_ids = set(reference_decision.get("pareto") or [])
     outcomes = []
     source_differences = {}
     for path in runs:
@@ -57,6 +59,10 @@ def compare(runs, reference_path, allow_controller_patch=False):
         for key in ("dataset_content_id", "task", "full_epochs", "training_seeds", "objective", "runtime_versions", "memory_kind"):
             if p[key] != reference_protocol[key]:
                 raise ValueError(f"Benchmark domain/protocol mismatch: {key}")
+        if p.get("detection_metric") != reference_protocol.get("detection_metric"):
+            raise ValueError("Benchmark detection-metric mismatch")
+        if p.get("quality_definition") != reference_protocol.get("quality_definition"):
+            raise ValueError("Benchmark quality-definition mismatch")
         if p.get("selection_rule", "weighted") != reference_protocol.get("selection_rule", "weighted"):
             raise ValueError("Benchmark selection-rule mismatch")
         if p.get("execution_policy") != reference_protocol.get("execution_policy"):
@@ -83,22 +89,52 @@ def compare(runs, reference_path, allow_controller_patch=False):
         rule_regret = scores[rule_best] - scores[key] if ref_complete and rule_best in scores and key in scores and p.get("selection_rule", "weighted") != "knee" else None
         state_path = folder / "state.json"
         state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {"probes": []}
-        outcomes.append({"run": str(folder), "method": p["method"], "search_seed": p["search_seed"],
-                         "selected": key, "feasible": key is not None, "reference_feasibility_disagreement": key is not None and (not oracle_row or oracle_row["utility"] is None),
-                         "objective_regret": regret, "selection_rule_regret": rule_regret, "online_seconds": report["online_session_seconds"],
-                         "budget_seconds": p["budget_seconds"], "overrun_seconds": report["budget_overrun_seconds"],
-                         "checked_attempts": checked, "time_to_first_full_config_seconds": first_full_seconds(folder, p, rows),
-                         "proxy_diagnostics": proxy_reference_diagnostics(state, p, reference)})
+        outcome = {"run": str(folder), "method": p["method"], "search_seed": p["search_seed"],
+                   "selected": key, "feasible": key is not None, "reference_feasibility_disagreement": key is not None and (not oracle_row or oracle_row["utility"] is None),
+                   "objective_regret": regret, "selection_rule_regret": rule_regret, "online_seconds": report["online_session_seconds"],
+                   "budget_seconds": p["budget_seconds"], "overrun_seconds": report["budget_overrun_seconds"],
+                   "checked_attempts": checked, "time_to_first_full_config_seconds": first_full_seconds(folder, p, rows),
+                   "proxy_diagnostics": proxy_reference_diagnostics(state, p, reference)}
+        extended = "detection_metric" in reference_protocol or tuple(int(x) for x in str(reference_protocol.get("implementation_version", "0.0.0")).split(".")[:2]) >= (0, 11)
+        if extended:
+            valid_oracle = oracle_row is not None and oracle_row["utility"] is not None
+            traj = anytime_trajectory(folder, p, reference=reference)
+            outcome.update(
+                selected_reference_quality=oracle_row["quality_mean"] if valid_oracle else None,
+                quality_regret=(best_quality_row["quality_mean"] - oracle_row["quality_mean"]) if best_quality_row and valid_oracle else None,
+                exact_optimum_hit=(key == best["config_id"]) if best and valid_oracle else False if ref_complete else None,
+                pareto_hit=(key in pareto_ids) if ref_complete and valid_oracle else False if ref_complete else None,
+                auarc=traj["auarc"],
+                time_to_target_95=traj["time_to_target_95"],
+                anytime_trajectory=traj["trajectory"],
+            )
+        outcomes.append(outcome)
     summaries = []
+    extended_summary = any("quality_regret" in r for r in outcomes)
     for method in dict.fromkeys(r["method"] for r in outcomes):
         rows = [r for r in outcomes if r["method"] == method]
         regrets = [r["objective_regret"] for r in rows if r["objective_regret"] is not None]
-        summaries.append({"method": method, "n": len(rows), "feasible_count": sum(r["feasible"] for r in rows),
-                          "feasibility_rate": statistics.mean(r["feasible"] for r in rows),
-                          "conditional_regret_mean": statistics.mean(regrets) if regrets else None,
-                          "conditional_regret_sd": statistics.stdev(regrets) if len(regrets) > 1 else None,
-                          "regret_available_count": len(regrets), "online_seconds_mean": statistics.mean(r["online_seconds"] for r in rows),
-                          "failed_selection_count": sum(not r["feasible"] for r in rows)})
+        item = {"method": method, "n": len(rows), "feasible_count": sum(r["feasible"] for r in rows),
+                "feasibility_rate": statistics.mean(r["feasible"] for r in rows),
+                "conditional_regret_mean": statistics.mean(regrets) if regrets else None,
+                "conditional_regret_sd": statistics.stdev(regrets) if len(regrets) > 1 else None,
+                "regret_available_count": len(regrets), "online_seconds_mean": statistics.mean(r["online_seconds"] for r in rows),
+                "failed_selection_count": sum(not r["feasible"] for r in rows)}
+        if extended_summary:
+            q_regrets = [r["quality_regret"] for r in rows if r.get("quality_regret") is not None]
+            opt_hits = [bool(r["exact_optimum_hit"]) for r in rows if r.get("exact_optimum_hit") is not None]
+            par_hits = [bool(r["pareto_hit"]) for r in rows if r.get("pareto_hit") is not None]
+            auarcs = [r["auarc"] for r in rows if r.get("auarc") is not None]
+            ttts = [r["time_to_target_95"] for r in rows if r.get("time_to_target_95") is not None]
+            item.update(
+                conditional_quality_regret_mean=statistics.mean(q_regrets) if q_regrets else None,
+                exact_optimum_hit_rate=statistics.mean(opt_hits) if opt_hits else None,
+                pareto_hit_rate=statistics.mean(par_hits) if par_hits else None,
+                auarc_mean=statistics.mean(auarcs) if auarcs else None,
+                time_to_target_95_mean=statistics.mean(ttts) if ttts else None,
+                time_to_target_95_reached_count=len(ttts),
+            )
+        summaries.append(item)
     return {"schema_version": 1, "scope": "exploratory paired repeated search on one domain/hardware; not general superiority",
             "outcomes": outcomes, "summaries": summaries, "reference_complete": ref_complete,
             "reference": reference_path, "reference_selected": best["config_id"] if best else None,
@@ -139,8 +175,10 @@ def benchmark(args):
               "--cost-margin", str(args.cost_margin), "--cleanup-seconds", str(args.cleanup_seconds),
               "--time-scale", str(args.time_scale), "--memory-scale", str(args.memory_scale),
               "--min-quality", str(args.min_quality), "--weights", *map(str, args.weights), "--seeds", *map(str, args.seeds)]
-    common += ["--selection-rule", args.selection_rule]
-    common += ["--acquisition-ridge", str(getattr(args, "acquisition_ridge", 0.05)),
+    common += ["--selection-rule", args.selection_rule,
+               "--detection-metric", getattr(args, "detection_metric", "map50")]
+    common += ["--acquisition-version", str(getattr(args, "acquisition_version", 2)),
+               "--acquisition-ridge", str(getattr(args, "acquisition_ridge", 0.05)),
                "--acquisition-length-scale", str(getattr(args, "acquisition_length_scale", 1.0)),
                "--acquisition-exploration", str(getattr(args, "acquisition_exploration", 0.25)),
                "--acquisition-novelty", str(getattr(args, "acquisition_novelty", 0.05))]
@@ -185,10 +223,27 @@ def benchmark(args):
 
 def _publish_benchmark(folder, report):
     write_json(folder / "BENCHMARK.json", report)
-    lines = ["# Benchmark nghiên cứu v2", "", report["scope"], "",
-             "| Method | Feasible | Conditional regret mean | Actual online seconds mean |", "|---|---:|---:|---:|"]
-    for r in report["summaries"]:
-        lines.append(f"| {r['method']} | {r['feasible_count']}/{r['n']} | {r['conditional_regret_mean']} (available {r['regret_available_count']}) | {r['online_seconds_mean']:.2f} |")
+    has_q = any("conditional_quality_regret_mean" in r for r in report["summaries"])
+    if has_q:
+        lines = ["# Benchmark nghiên cứu v2", "", report["scope"], "",
+                 "| Method | Feasible | Conditional U regret mean | Quality regret mean | Exact opt hit | Pareto hit | AUARC mean | TTT-95 mean | Actual online seconds mean |",
+                 "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        for r in report["summaries"]:
+            opt_rate = "—" if r.get("exact_optimum_hit_rate") is None else f"{r['exact_optimum_hit_rate']:.2%}"
+            par_rate = "—" if r.get("pareto_hit_rate") is None else f"{r['pareto_hit_rate']:.2%}"
+            auarc_s = "—" if r.get("auarc_mean") is None else f"{r['auarc_mean']:.5f}"
+            ttt_s = "—" if r.get("time_to_target_95_mean") is None else f"{r['time_to_target_95_mean']:.2f}s"
+            lines.append(
+                f"| {r['method']} | {r['feasible_count']}/{r['n']} | "
+                f"{r['conditional_regret_mean']} (n={r['regret_available_count']}) | "
+                f"{r.get('conditional_quality_regret_mean')} | {opt_rate} | {par_rate} | "
+                f"{auarc_s} | {ttt_s} | {r['online_seconds_mean']:.2f} |"
+            )
+    else:
+        lines = ["# Benchmark nghiên cứu v2", "", report["scope"], "",
+                 "| Method | Feasible | Conditional regret mean | Actual online seconds mean |", "|---|---:|---:|---:|"]
+        for r in report["summaries"]:
+            lines.append(f"| {r['method']} | {r['feasible_count']}/{r['n']} | {r['conditional_regret_mean']} (available {r['regret_available_count']}) | {r['online_seconds_mean']:.2f} |")
     lines += ["", f"Independent full reference complete: {report['reference_complete']}; reference cost {report['reference_cost_seconds']}s.",
               "Failed choices have null regret, not zero. Decisions locked before reference; no test evaluation in this benchmark.",
               "Repeated searches on one dataset/GPU do not establish statistical superiority or unseen-GPU reliability."]

@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Kiểm toán &amp; Xuất báo cáo NCKH</h1>
+    <div class="subtitle">Kiểm toán SHA-256 chỉ đọc chỉ bằng 1 cú nhấp chuột và xuất bộ tài liệu LaTeX, CSV, biểu đồ SVG chuẩn báo cáo.</div>
+  </div>
+  <div>
+    <select id="export-run-select" style="min-width:340px;"></select>
+  </div>
+</div>
+
+<div class="grid grid-2">
+  <div class="card">
+    <h2>1. Kiểm toán toàn vẹn dữ liệu &amp; bằng chứng (Chỉ đọc)</h2>
+    <p class="subtitle">Kiểm tra chữ ký mã nguồn, mã SHA-256 tập dữ liệu/tập con, nhật ký băm chuỗi, trọng số checkpoint và tính khớp của quyết định chọn.</p>
+    <button id="btn-run-audit" type="button" class="btn btn-primary">Chạy kiểm toán SHA-256</button>
+    <div id="audit-result" style="margin-top:0.85rem;"></div>
+  </div>
+
+  <div class="card">
+    <h2>2. Xuất bộ tài liệu báo cáo (paper-export)</h2>
+    <div class="form-row">
+      <div>
+        <label for="export-output-dir">Thư mục xuất (nằm an toàn trong runs/)</label>
+        <input id="export-output-dir" type="text" />
+      </div>
+      <div>
+        <label for="export-lang">Ngôn ngữ báo cáo</label>
+        <select id="export-lang">
+          <option value="vi">Tiếng Việt (vi)</option>
+          <option value="en">Tiếng Anh (en)</option>
+        </select>
+      </div>
+    </div>
+    <button id="btn-run-export" type="button" class="btn btn-primary">Tạo bộ tài liệu báo cáo</button>
+    <div id="export-result" style="margin-top:0.85rem;"></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Xem trước tài liệu xuất (SVG / LaTeX / Markdown / CSV)</h2>
+  <div id="artifact-preview" class="subtitle">Nhấn nút «Xem trước» ở danh sách tệp vừa tạo phía trên để kiểm tra trực tiếp offline.</div>
+</div>
+{% endblock %}

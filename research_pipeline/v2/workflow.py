@@ -18,7 +18,7 @@ from research_pipeline.integrity import ROOT, freeze_sources, hardware_changes, 
 from research_pipeline.study import exclusive_run, require_idle
 from . import __version__
 from .ledger import Ledger, read_events
-from .schema import METRICS, TASKS, complete, lock_protocol, validate_protocol
+from .schema import DETECTION_METRICS, METRICS, TASKS, complete, lock_protocol, validate_protocol
 from .space import build_space
 from .model_features import describe_models, descriptor_for
 from .data_features import describe_dataset
@@ -83,6 +83,8 @@ def prepare(args, origin=None):
     predictor = json.loads(Path(args.predictor).read_text(encoding="utf-8")) if args.predictor else None
     if predictor and predictor["sha256"] != digest({k: v for k, v in predictor.items() if k != "sha256"}):
         raise ValueError("Predictor card checksum mismatch")
+    det_metric = getattr(args, "detection_metric", "map50") if manifest["task"] == "detection" else None
+    quality_def = DETECTION_METRICS[det_metric] if manifest["task"] == "detection" else METRICS[manifest["task"]]
     p = {"implementation_version": __version__, "mode": getattr(args, "mode", "online"), "method": args.method,
          "execution_policy": {"version": 2,
                               "integrity": "stat_cached_between_trials_full_hash_boundaries",
@@ -97,10 +99,10 @@ def prepare(args, origin=None):
          "training_seeds": args.seeds, "split_seed": args.split_seed, "search_seed": args.search_seed,
          "full_epochs": args.full_epochs, "probe_epochs": args.probe_epochs, "trial_timeout": args.trial_timeout,
          "budget_seconds": args.budget_seconds, "objective": asdict(objective), "example_counts": counts, "num_classes": len(manifest["names"]),
-         "quality_definition": METRICS[manifest["task"]],
+         "quality_definition": quality_def,
          "determinism_policy": "strict torch deterministic algorithms; caption tiny encoder uses explicit adaptive-cell means for deterministic pooling backward",
          "memory_kind": "cuda_reserved_allocator_mib" if hw["device"] not in {"cpu", "mps"} else "process_tree_rss_mib_not_vram",
-         "scheduler": {"policy_version": 2, "probe_fraction": args.probe_fraction, "cost_margin": args.cost_margin, "cleanup_seconds": args.cleanup_seconds,
+         "scheduler": {"policy_version": 3, "probe_fraction": args.probe_fraction, "cost_margin": args.cost_margin, "cleanup_seconds": args.cleanup_seconds,
                        "rungs": getattr(args, "rungs", None) or [e for e in (1, 2, 4) if e <= args.full_epochs]},
          "predictor": predictor, "source_files": source_map(),
          "model_files": {c["model"]: sha(c["model"]) for c in configs if Path(c["model"]).is_file()},
@@ -109,9 +111,12 @@ def prepare(args, origin=None):
          "test_policy": "never used for config/checkpoint/objective selection; historical datasets are not blind",
          "development_history": "0.5/0.6 findings and Penn-Fudan/Fashion/CIFAR/ViECAP informed policy; new local trials are development, not unseen-domain proof",
          "reference_boundary": getattr(args, "reference_boundary", None)}
+    if det_metric is not None:
+        p["detection_metric"] = det_metric
     # Locked for every method in a study so baseline/reference comparison never
     # changes the representation or tuning choices after seeing outcomes.
-    p["acquisition"] = {"version": 1, "kernel_ridge": getattr(args, "acquisition_ridge", 0.05),
+    p["acquisition"] = {"version": getattr(args, "acquisition_version", 2),
+                        "kernel_ridge": getattr(args, "acquisition_ridge", 0.05),
                         "length_scale": getattr(args, "acquisition_length_scale", 1.0),
                         "exploration": getattr(args, "acquisition_exploration", 0.25),
                         "novelty_weight": getattr(args, "acquisition_novelty", 0.05)}
@@ -130,9 +135,11 @@ def prepare(args, origin=None):
                 raise ValueError("Reference boundary decision identity differs")
             if prior["dataset_content_id"] != p["dataset_content_id"] or prior["config_ids"] != [config_id(c) for c in configs]:
                 raise ValueError("Reference boundary uses different data/space")
-            for key in ("full_epochs", "training_seeds", "objective", "runtime_versions", "selection_rule", "execution_policy", "scheduler"):
+            for key in ("full_epochs", "training_seeds", "objective", "runtime_versions", "selection_rule", "execution_policy", "scheduler", "quality_definition"):
                 if digest(prior[key]) != digest(p[key]):
                     raise ValueError(f"Reference boundary differs: {key}")
+            if prior.get("detection_metric") != p.get("detection_metric"):
+                raise ValueError("Reference boundary differs: detection_metric")
         p["reference_boundary_sha256"] = sha(boundary)
     protocol = lock_protocol(p)
     freeze_sources(folder, protocol["source_files"])
@@ -140,6 +147,7 @@ def prepare(args, origin=None):
     ledger.emit("protocol_locked", protocol_sha256=protocol["protocol_sha256"])
     write_json(folder / "status.json", {"phase": "prepared"})
     pairs([("Thư mục mới", folder), ("Task / thiết bị", f"{manifest['task']} / {hw.get('gpu') or hw['device']}"),
+           ("Metric khóa trước", protocol["quality_definition"]),
            ("Kế hoạch", f"{len(configs)} cấu hình × {len(args.seeds)} seeds × {args.full_epochs} epoch"),
            ("Ngân sách chung", duration(args.budget_seconds)), ("Protocol", folder / "protocol.json")])
     say("  Theo dõi ở cửa sổ khác: " + command(["status", "--run", str(folder)]))
@@ -216,6 +224,8 @@ def audit_run(path, check_published=True):
             raise ValueError("Worker request differs from protocol")
         if "execution_policy" in protocol and req.get("data_loader") != protocol["execution_policy"]["data_loader"]:
             raise ValueError("Worker data-loader request differs from locked execution policy")
+        if "detection_metric" in protocol and req.get("detection_metric") != protocol["detection_metric"]:
+            raise ValueError("Worker detection_metric request differs from locked protocol")
         full = result["mode"] == "train"
         expected_manifest = folder / ("dataset.json" if full else "subset.json")
         allowed_epochs = [protocol["full_epochs"]] if full else protocol["scheduler"].get("rungs", [protocol["probe_epochs"]]) if protocol["method"] == "successive_halving" else [protocol["probe_epochs"]]
@@ -227,6 +237,11 @@ def audit_run(path, check_published=True):
             checkpoint = Path(result["best_checkpoint"]).resolve()
             if not checkpoint.is_relative_to(trial) or sha(checkpoint) != result["checkpoint_sha256"]:
                 raise ValueError("Checkpoint identity changed")
+            if "detection_metric" in protocol:
+                if result.get("primary_metric") != protocol["detection_metric"]:
+                    raise ValueError("Completed worker primary_metric differs from locked protocol")
+                if result.get("best_checkpoint_epoch") != result.get("best_epoch"):
+                    raise ValueError("Completed worker best.pt epoch differs from primary metric optimum")
         if event["worker_seconds"] != result["worker_wall_seconds"] or event["status"] != result["status"]:
             raise ValueError("Ledger time/status mismatch")
     if seen != set(completions):
@@ -267,6 +282,10 @@ def audit_run(path, check_published=True):
             for key in ("acquisition_policy", "acquisition_history", "acquisition_uses_full_confirmations_only", "uncertainty_calibrated"):
                 if published[key] != report[key]:
                     raise ValueError(f"Published acquisition trace changed: {key}")
+        if "detection_metric" in protocol:
+            for key in ("detection_metric", "detection_diagnostics"):
+                if published[key] != report.get(key):
+                    raise ValueError(f"Published detection metric diagnostics changed: {key}")
         if "selection_rule" in protocol:
             expected = {"presets.json": {"protocol_sha256": protocol["protocol_sha256"], "full_epochs": protocol["full_epochs"],
                                          "memory_kind": protocol["memory_kind"], "presets": published["presets"], "test_used": False},
@@ -322,7 +341,7 @@ def execute(folder, protocol, ledger, initial=None, resume_budget=None, charge_p
             if seconds <= 0.05:
                 raise TimeoutError("Budget exhausted during integrity/preflight")
             count = len(list((folder / "trials").glob("attempt_*")))
-            result = run_worker(folder / "trials" / f"attempt_{count + 1:05d}", protocol, whole if full else sampled, full, index, seed, epochs, seconds, ledger)
+            result = run_worker(folder / "trials" / f"attempt_{count + 1:05d}", protocol, whole if full else sampled, full, index, seed, epochs, seconds, ledger, budget_remaining_fn=wall_remaining)
             if modern:
                 final_budget.observe(result)
             return result

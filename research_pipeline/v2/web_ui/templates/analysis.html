@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Phân tích &amp; Biên Pareto</h1>
+    <div class="subtitle">Khám phá đánh đổi Chất lượng – Thời gian – VRAM, đường học, dự báo Surrogate, hội tụ thời gian thực và kết quả tập Test.</div>
+  </div>
+  <div>
+    <select id="analysis-run-select" style="min-width:340px;"></select>
+  </div>
+</div>
+
+<div id="analysis-kpis" class="grid grid-4" style="margin-bottom:1rem;"></div>
+
+<div class="grid grid-2">
+  <div class="card">
+    <h2>Biên Pareto (Chất lượng – Thời gian – VRAM)</h2>
+    <div class="subtitle" style="margin:-0.45rem 0 0.65rem 0;">Điểm ★ là cấu hình được chọn; đường nét đứt nối các cấu hình không bị trội (Pareto).</div>
+    <div id="chart-pareto" class="chart-box"></div>
+  </div>
+  <div class="card">
+    <h2>Đường học theo Epoch (Xác nhận đầy đủ)</h2>
+    <div class="subtitle" style="margin:-0.45rem 0 0.65rem 0;">Diễn biến chất lượng Validation qua từng epoch trên toàn bộ dữ liệu và seed.</div>
+    <div id="chart-learning" class="chart-box"></div>
+  </div>
+</div>
+
+<div class="grid grid-2">
+  <div class="card">
+    <h2>Độ chính xác dự báo Surrogate (Dự đoán vs Thực đo)</h2>
+    <div class="subtitle" style="margin:-0.45rem 0 0.65rem 0;">Càng sát đường chéo đứt nét, mô hình dự đoán chất lượng càng chính xác.</div>
+    <div id="chart-surrogate" class="chart-box"></div>
+  </div>
+  <div class="card">
+    <h2>Hội tụ theo thời gian thực (Anytime)</h2>
+    <div class="subtitle" style="margin:-0.45rem 0 0.65rem 0;">Điểm hữu ích U tốt nhất đạt được tính theo từng giây tìm kiếm đã dùng.</div>
+    <div id="chart-anytime" class="chart-box"></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Mô phỏng đổi trọng số ưu tiên (Post-hoc)</h2>
+  <div class="alert alert-warn">
+    <strong>Lưu ý khoa học bắt buộc:</strong>
+    <span>Phân tích độ nhạy hậu nghiệm — không làm thay đổi quyết định nghiên cứu đã khóa</span>.
+    Mô phỏng chỉ tính lại xếp hạng trên các cấu hình đã xác nhận khả thi và không ghi đè tệp kết quả.
+  </div>
+  <div class="pill-row" style="margin-bottom:0.85rem;">
+    <span class="subtitle" style="margin:0;align-self:center;">Chọn nhanh mục tiêu:</span>
+    <button type="button" class="pill-btn weight-preset-btn" data-preset-w="0.6,0.25,0.15">Cân bằng (0.6 / 0.25 / 0.15)</button>
+    <button type="button" class="pill-btn weight-preset-btn" data-preset-w="0.8,0.1,0.1">Ưu tiên Độ chính xác</button>
+    <button type="button" class="pill-btn weight-preset-btn" data-preset-w="0.4,0.5,0.1">Ưu tiên Tốc độ</button>
+    <button type="button" class="pill-btn weight-preset-btn" data-preset-w="0.4,0.15,0.45">Tiết kiệm VRAM</button>
+  </div>
+  <div class="grid grid-3" style="margin-bottom:0.85rem;">
+    <div>
+      <label for="slider-wa">Trọng số Chất lượng w_A: <span id="val-wa" class="mono">0.60</span></label>
+      <input id="slider-wa" type="range" min="0" max="1" step="any" value="0.60" />
+    </div>
+    <div>
+      <label for="slider-wt">Trọng số Thời gian w_T: <span id="val-wt" class="mono">0.25</span></label>
+      <input id="slider-wt" type="range" min="0" max="1" step="any" value="0.25" />
+    </div>
+    <div>
+      <label for="slider-wm">Trọng số VRAM w_M: <span id="val-wm" class="mono">0.15</span></label>
+      <input id="slider-wm" type="range" min="0" max="1" step="any" value="0.15" />
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th class="num">Hạng mô phỏng</th>
+          <th>Cấu hình</th>
+          <th class="num">Chất lượng Val</th>
+          <th class="num">Thời gian TB</th>
+          <th class="num">VRAM đỉnh</th>
+          <th class="num">U đã khóa</th>
+          <th class="num">U mô phỏng</th>
+        </tr>
+      </thead>
+      <tbody id="sensitivity-table-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Đánh giá độc lập trên tập Test (evaluate-v2)</h2>
+  <div id="eval-summary-box" style="margin-bottom:1rem;"></div>
+  <div class="grid grid-2">
+    <div>
+      <h3>AP từng lớp (AP@50 &amp; AP@50-95)</h3>
+      <div id="chart-per-class" class="chart-box"></div>
+    </div>
+    <div>
+      <h3>Đường cong Precision–Recall</h3>
+      <div id="chart-pr" class="chart-box"></div>
+    </div>
+  </div>
+  <div class="grid grid-2" style="margin-top:1rem;">
+    <div>
+      <h3>Đường cong F1 theo độ tin cậy</h3>
+      <div id="chart-f1" class="chart-box"></div>
+    </div>
+    <div>
+      <h3>Ma trận nhầm lẫn chuẩn hóa</h3>
+      <div id="chart-cm" class="chart-box"></div>
+    </div>
+  </div>
+</div>
+{% endblock %}

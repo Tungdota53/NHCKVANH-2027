@@ -11,6 +11,9 @@ from pathlib import Path
 import random
 import statistics
 
+import numpy as np
+from scipy.stats import wilcoxon as _scipy_wilcoxon
+
 from research_pipeline.integrity import sha
 from yolo_tuner.pipeline import write_json
 from yolo_tuner.research import digest
@@ -106,12 +109,88 @@ def _method_summary(outcomes, settings):
     return summaries
 
 
+def _paired_wilcoxon(differences):
+    n = len(differences)
+    if all(x == 0.0 for x in differences):
+        return {
+            "statistic": 0.0,
+            "p_value": 1.0,
+            "n": n,
+            "n_nonzero": 0,
+            "zero_method": "wilcox",
+            "status": "all_zero_differences",
+        }
+    res = _scipy_wilcoxon(differences, alternative="two-sided", zero_method="wilcox", method="auto")
+    p_val = min(1.0, max(0.0, float(res.pvalue)))
+    return {
+        "statistic": float(res.statistic),
+        "p_value": p_val,
+        "n": n,
+        "n_nonzero": sum(1 for x in differences if x != 0.0),
+        "zero_method": "wilcox",
+        "status": "ok",
+    }
+
+
+def _exact_sign_flip(differences, *, seed=2027, mc_samples=20000):
+    diffs = np.asarray(differences, dtype=np.float64)
+    n = len(diffs)
+    obs = float(abs(diffs.sum()))
+    tol = 1e-12 * float(np.abs(diffs).sum())
+    if np.all(diffs == 0.0):
+        return {
+            "p_value": 1.0,
+            "observed_abs_sum": 0.0,
+            "method": "exact" if n <= 16 else "monte_carlo",
+            "permutations": (1 << n) if n <= 16 else mc_samples,
+            "status": "all_zero_differences",
+        }
+    if n <= 16:
+        signs = ((np.arange(1 << n)[:, None] >> np.arange(n)) & 1) * 2.0 - 1.0
+        abs_sums = np.abs(signs @ diffs)
+        count = int(np.sum(abs_sums >= obs - tol))
+        p_val = float(min(1.0, count / (1 << n)))
+        method_name = "exact"
+        perms = 1 << n
+    else:
+        rng = np.random.default_rng(seed)
+        signs = rng.choice(np.array([-1.0, 1.0]), size=(mc_samples, n))
+        abs_sums = np.abs(signs @ diffs)
+        count = int(np.sum(abs_sums >= obs - tol))
+        p_val = float(min(1.0, (1 + count) / (mc_samples + 1)))
+        method_name = "monte_carlo"
+        perms = mc_samples
+    return {
+        "p_value": p_val,
+        "observed_abs_sum": obs,
+        "method": method_name,
+        "permutations": perms,
+        "status": "ok",
+    }
+
+
+def _holm_bonferroni(p_values):
+    m = len(p_values)
+    if m == 0:
+        return []
+    indexed = sorted(enumerate(p_values), key=lambda item: item[1])
+    adjusted = [0.0] * m
+    running_max = 0.0
+    for rank, (orig_idx, p_val) in enumerate(indexed):
+        val = min(1.0, max(0.0, float(p_val)) * (m - rank))
+        running_max = max(running_max, val)
+        adjusted[orig_idx] = running_max
+    return adjusted
+
+
 def _paired(outcomes, settings):
     by_method = defaultdict(dict)
     for row in outcomes:
         by_method[row["method"]][row["search_seed"]] = row
     comparisons = []
+    metric_names = ("objective_regret", "online_seconds", "time_to_first_full_config_seconds", "feasible")
     for method in sorted(by_method):
+        method_comparisons = []
         for baseline in BASELINES:
             if method == baseline or baseline not in by_method:
                 continue
@@ -120,19 +199,48 @@ def _paired(outcomes, settings):
                 raise ValueError("Methods must have exactly paired search seeds")
             seeds = sorted(left)
             metrics = {}
-            for metric in ("objective_regret", "online_seconds", "time_to_first_full_config_seconds", "feasible"):
+            for metric in metric_names:
                 pairs = [(seed, left[seed][metric], right[seed][metric]) for seed in seeds
                          if left[seed][metric] is not None and right[seed][metric] is not None]
                 differences = [float(a) - float(b) for _, a, b in pairs]
-                metrics[metric] = {"direction": "positive favors candidate" if metric == "feasible" else "negative favors candidate",
-                                   "paired_seed_count": len(pairs), "paired_seeds": [seed for seed, _, _ in pairs],
-                                   "unavailable_pairs": len(seeds) - len(pairs),
-                                   "candidate_minus_baseline": bootstrap_mean(differences, **settings)}
-            comparisons.append({"candidate": method, "baseline": baseline, "search_seeds": seeds,
-                                "candidate_no_verified_selection": sum(not row["feasible"] for row in left.values()),
-                                "baseline_no_verified_selection": sum(not row["feasible"] for row in right.values()),
-                                "conditional_regret_warning": "Only seeds with available regret for BOTH methods are compared; failures remain separate, never regret zero.",
-                                "metrics": metrics})
+                entry = {
+                    "direction": "positive favors candidate" if metric == "feasible" else "negative favors candidate",
+                    "paired_seed_count": len(pairs),
+                    "paired_seeds": [seed for seed, _, _ in pairs],
+                    "unavailable_pairs": len(seeds) - len(pairs),
+                    "candidate_minus_baseline": bootstrap_mean(differences, **settings),
+                }
+                if len(pairs) >= MIN_BOOTSTRAP_REPEATS:
+                    entry["wilcoxon"] = _paired_wilcoxon(differences)
+                    entry["sign_flip"] = _exact_sign_flip(differences, seed=settings["seed"])
+                    entry["validity_statement"] = (
+                        "Conditional on the observed dataset, hardware, locked budget, and exhaustive reference across paired search_seeds; "
+                        "training_seeds are not independent repeats and this is not a cross-domain confidence interval."
+                    )
+                metrics[metric] = entry
+            method_comparisons.append({
+                "candidate": method,
+                "baseline": baseline,
+                "search_seeds": seeds,
+                "candidate_no_verified_selection": sum(not row["feasible"] for row in left.values()),
+                "baseline_no_verified_selection": sum(not row["feasible"] for row in right.values()),
+                "conditional_regret_warning": "Only seeds with available regret for BOTH methods are compared; failures remain separate, never regret zero.",
+                "metrics": metrics,
+            })
+        for metric in metric_names:
+            active = [comp for comp in method_comparisons if "sign_flip" in comp["metrics"][metric]]
+            if active:
+                adj_sf = _holm_bonferroni([c["metrics"][metric]["sign_flip"]["p_value"] for c in active])
+                adj_wx = _holm_bonferroni([c["metrics"][metric]["wilcoxon"]["p_value"] for c in active])
+                for comp, p_sf, p_wx in zip(active, adj_sf, adj_wx):
+                    comp["metrics"][metric]["holm"] = {
+                        "adjusted_p_value": p_sf,
+                        "sign_flip_adjusted_p_value": p_sf,
+                        "wilcoxon_adjusted_p_value": p_wx,
+                        "family": "candidate_vs_active_baselines_per_metric",
+                        "family_size": len(active),
+                    }
+        comparisons.extend(method_comparisons)
     return comparisons
 
 
@@ -180,7 +288,7 @@ def _audit_study(folder, reference_path, required_methods, settings):
     reference_seconds = _finite(reference_report["online_session_seconds"], "Measured exhaustive reference cost", positive=True)
     expected = {(method, seed) for method in methods for seed in seeds}
     seen, checked, protocols, all_run_paths = set(), reference_checked, [], set()
-    comparable_fields = ("dataset_content_id", "task", "config_ids", "full_epochs", "training_seeds", "objective", "selection_rule",
+    comparable_fields = ("dataset_content_id", "task", "detection_metric", "quality_definition", "config_ids", "full_epochs", "training_seeds", "objective", "selection_rule",
                          "runtime_versions", "memory_kind", "execution_policy", "acquisition", "subset_sha256", "split_seed", "probe_epochs", "trial_timeout", "scheduler")
     for path in paths:
         run = Path(path).resolve()
@@ -240,6 +348,7 @@ def _audit_study(folder, reference_path, required_methods, settings):
         if row["budget_seconds"] != budget:
             raise ValueError("Audited comparison budget mismatch")
     domain = {"dataset_content_id": ref_protocol["dataset_content_id"], "task": ref_protocol["task"], "hardware": hardware}
+    paired = _paired(outcomes, settings)
     study = {"study": str(folder), "study_id": digest(str(folder))[:16], "benchmark_sha256": manifest["sha256"],
              "domain": domain, "domain_id": digest(domain)[:16], "methods": methods, "missing_baselines": [method for method in BASELINES if method not in methods],
              "search_seeds": seeds, "training_seeds_not_independent_repeats": ref_protocol["training_seeds"],
@@ -249,9 +358,14 @@ def _audit_study(folder, reference_path, required_methods, settings):
              "raw_audited_attempts": checked, "search_budget_seconds": budget, "measured_exhaustive_reference_seconds": reference_seconds,
              "search_budget_to_reference_cost_ratio": budget / reference_seconds,
              "budget_comparison": "declared search budget is smaller than this measured independent reference cost, not a prediction or runtime guarantee",
-             "outcomes": outcomes, "method_summaries": _method_summary(outcomes, settings), "paired_comparisons": _paired(outcomes, settings),
+             "outcomes": outcomes, "method_summaries": _method_summary(outcomes, settings), "paired_comparisons": paired,
              "any_actual_budget_overrun": any(row["overrun_seconds"] > 0 for row in outcomes),
              "statistical_superiority_established": False}
+    if any("holm" in m for pair in paired for m in pair["metrics"].values()):
+        study["paired_nonparametric_scope"] = (
+            "Paired Wilcoxon signed-rank, exact sign-flip permutation, and Holm-Bonferroni adjustments condition strictly on this "
+            "observed dataset, hardware, reference, and paired search_seeds; never general superiority or a cross-domain confidence interval."
+        )
     return study, all_run_paths | {str(reference)}
 
 
@@ -272,12 +386,18 @@ def _summary(studies):
                        "budget_overrun_count": sum(row["overrun_seconds"] > 0 for row in rows),
                        "pooled_regret_or_domain_ci": None,
                        "aggregation_scope": "counts only; heterogeneous objectives/domains and reused seeds are not pooled as iid regret observations"})
+    warning = (
+        "Search seeds and training seeds on one dataset are not independent datasets; CPU and CUDA on one host are not two physical GPUs. "
+        "No cross-domain resampling or superiority inference is performed."
+    )
+    if any("paired_nonparametric_scope" in st for st in studies):
+        warning += " Training-seed SD and search-seed statistics are not a confidence interval over unseen datasets or GPUs."
     return {"study_count": len(studies), "unique_dataset_content_ids": datasets, "unique_dataset_count": len(datasets),
             "unique_observed_domain_count": len({study["domain_id"] for study in studies}),
             "physical_gpu_uuids": gpus, "physical_gpu_count": len(gpus), "cpu_hosts": list(cpus.values()), "cpu_host_count": len(cpus),
             "mps_host_count_not_verified_physical_gpus": len({item["identity"] for item in hardware.values() if item["kind"].startswith("mps_")}),
             "method_totals": totals, "cross_domain_confidence_interval": None,
-            "independence_warning": "Search seeds and training seeds on one dataset are not independent datasets; CPU and CUDA on one host are not two physical GPUs. No cross-domain resampling or superiority inference is performed."}
+            "independence_warning": warning}
 
 
 def markdown(report):
@@ -296,12 +416,30 @@ def markdown(report):
         for row in study["method_summaries"]:
             regret = row["conditional_objective_regret"]
             lines.append(f"| {row['method']} | {row['verified_selection_count']}/{row['search_repetitions']} | {regret['mean']} | {regret['sd']} | {regret['interval']} / {regret['status']} (n={regret['n']}) |")
-        lines += ["", "### Paired differences: candidate minus baseline", "", "Negative regret/time differences favor candidate; positive feasibility differences favor candidate.", "",
-                  "| Candidate / baseline | Metric | Paired n | Mean difference | Search-repeat CI / status |", "|---|---|---:|---:|---|"]
-        for pair in study["paired_comparisons"]:
-            for metric, values in pair["metrics"].items():
-                difference = values["candidate_minus_baseline"]
-                lines.append(f"| {pair['candidate']} / {pair['baseline']} | {metric} | {difference['n']} | {difference['mean']} | {difference['interval']} / {difference['status']} |")
+        has_nonparam = "paired_nonparametric_scope" in study
+        if has_nonparam:
+            lines += ["", "### Paired differences: candidate minus baseline", "",
+                      "Negative regret/time differences favor candidate; positive feasibility differences favor candidate.", "",
+                      study["paired_nonparametric_scope"], "",
+                      "| Candidate / baseline | Metric | Paired n | Mean difference | Search-repeat CI / status | Wilcoxon p | Sign-flip p | Holm adj. p |",
+                      "|---|---|---:|---:|---|---:|---:|---:|"]
+            for pair in study["paired_comparisons"]:
+                for metric, values in pair["metrics"].items():
+                    difference = values["candidate_minus_baseline"]
+                    wx_p = f"{values['wilcoxon']['p_value']:.4f}" if "wilcoxon" in values else "—"
+                    sf_p = f"{values['sign_flip']['p_value']:.4f}" if "sign_flip" in values else "—"
+                    hm_p = f"{values['holm']['adjusted_p_value']:.4f}" if "holm" in values else "—"
+                    lines.append(
+                        f"| {pair['candidate']} / {pair['baseline']} | {metric} | {difference['n']} | {difference['mean']} | "
+                        f"{difference['interval']} / {difference['status']} | {wx_p} | {sf_p} | {hm_p} |"
+                    )
+        else:
+            lines += ["", "### Paired differences: candidate minus baseline", "", "Negative regret/time differences favor candidate; positive feasibility differences favor candidate.", "",
+                      "| Candidate / baseline | Metric | Paired n | Mean difference | Search-repeat CI / status |", "|---|---|---:|---:|---|"]
+            for pair in study["paired_comparisons"]:
+                for metric, values in pair["metrics"].items():
+                    difference = values["candidate_minus_baseline"]
+                    lines.append(f"| {pair['candidate']} / {pair['baseline']} | {metric} | {difference['n']} | {difference['mean']} | {difference['interval']} / {difference['status']} |")
     lines += ["", "## Limitations", ""] + [f"- {limitation}" for limitation in report["limitations"]]
     return "\n".join(lines) + "\n"
 
@@ -361,6 +499,10 @@ def analyze_studies(manifest_path, output_directory=None):
                               "Budget restriction compares locked search budgets with measured reference wall cost, not a guaranteed lower bound on exhaustive training or a hard real-time guarantee.",
                               "Observed budget overruns, source/runtime matching and dataset/GPU/CPU counts are disclosed; seed counts cannot replace independent domains.",
                               "Counts across heterogeneous studies are descriptive only; there is no pooled iid regret interval, cross-domain confidence interval, or universal optimum claim."]}
+    if any("paired_nonparametric_scope" in st for st in studies):
+        report["limitations"].append(
+            "Paired Wilcoxon signed-rank, exact sign-flip permutation, and Holm-Bonferroni statistics condition strictly on the observed dataset, hardware, reference, and paired search_seeds; training-seed SD is not a confidence interval over datasets or GPUs."
+        )
     report["sha256"] = digest(report)
     if output:
         output.mkdir(parents=True, exist_ok=False)
