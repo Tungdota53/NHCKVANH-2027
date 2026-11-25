@@ -72,6 +72,13 @@ def validate_protocol(p):
         from .selection import RULES
         if p["selection_rule"] not in RULES:
             raise ValueError("Unknown selection rule")
+    if "quality_tolerance" in p:
+        qt = p["quality_tolerance"]
+        if isinstance(qt, bool) or not isinstance(qt, (int, float)) or not math.isfinite(qt) or not 0.0 <= qt <= 1.0:
+            raise ValueError("quality_tolerance must be finite in [0, 1]")
+    if "conformal_vram_card" in p and p["conformal_vram_card"] is not None:
+        from .conformal_vram import verify_conformal_vram_card
+        verify_conformal_vram_card(p["conformal_vram_card"])
     from .scheduler import ADAPTIVE_METHODS
     if p.get("method") in ADAPTIVE_METHODS and "acquisition" not in p:
         raise ValueError("Adaptive method needs a locked acquisition specification")

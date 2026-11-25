@@ -113,6 +113,15 @@ def prepare(args, origin=None):
          "reference_boundary": getattr(args, "reference_boundary", None)}
     if det_metric is not None:
         p["detection_metric"] = det_metric
+    q_tol = getattr(args, "quality_tolerance", None)
+    if p["selection_rule"] == "epsilon_constraint" or q_tol is not None:
+        p["quality_tolerance"] = 0.03 if q_tol is None else float(q_tol)
+    conf_card_path = getattr(args, "conformal_vram_card", None)
+    if conf_card_path:
+        from .conformal_vram import verify_conformal_vram_card
+        conf_card = json.loads(Path(conf_card_path).read_text(encoding="utf-8"))
+        verify_conformal_vram_card(conf_card)
+        p["conformal_vram_card"] = conf_card
     # Locked for every method in a study so baseline/reference comparison never
     # changes the representation or tuning choices after seeing outcomes.
     p["acquisition"] = {"version": getattr(args, "acquisition_version", 2),
@@ -140,6 +149,8 @@ def prepare(args, origin=None):
                     raise ValueError(f"Reference boundary differs: {key}")
             if prior.get("detection_metric") != p.get("detection_metric"):
                 raise ValueError("Reference boundary differs: detection_metric")
+            if prior.get("quality_tolerance") != p.get("quality_tolerance"):
+                raise ValueError("Reference boundary differs: quality_tolerance")
         p["reference_boundary_sha256"] = sha(boundary)
     protocol = lock_protocol(p)
     freeze_sources(folder, protocol["source_files"])

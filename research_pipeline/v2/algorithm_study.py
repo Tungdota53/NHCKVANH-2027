@@ -21,6 +21,7 @@ from . import benchmark
 
 
 BASELINES = ("random", "reserve", "default", "successive_halving")
+PAIRWISE_BASELINES = BASELINES + ("tpe_bo", "mf_no_conformal")
 MIN_BOOTSTRAP_REPEATS = 5
 
 
@@ -191,7 +192,7 @@ def _paired(outcomes, settings):
     metric_names = ("objective_regret", "online_seconds", "time_to_first_full_config_seconds", "feasible")
     for method in sorted(by_method):
         method_comparisons = []
-        for baseline in BASELINES:
+        for baseline in PAIRWISE_BASELINES:
             if method == baseline or baseline not in by_method:
                 continue
             left, right = by_method[method], by_method[baseline]

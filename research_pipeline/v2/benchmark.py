@@ -65,6 +65,8 @@ def compare(runs, reference_path, allow_controller_patch=False):
             raise ValueError("Benchmark quality-definition mismatch")
         if p.get("selection_rule", "weighted") != reference_protocol.get("selection_rule", "weighted"):
             raise ValueError("Benchmark selection-rule mismatch")
+        if p.get("quality_tolerance") != reference_protocol.get("quality_tolerance"):
+            raise ValueError("Benchmark quality-tolerance mismatch")
         if p.get("execution_policy") != reference_protocol.get("execution_policy"):
             raise ValueError("Benchmark execution-policy mismatch")
         if p.get("acquisition") != reference_protocol.get("acquisition"):
@@ -89,16 +91,25 @@ def compare(runs, reference_path, allow_controller_patch=False):
         rule_regret = scores[rule_best] - scores[key] if ref_complete and rule_best in scores and key in scores and p.get("selection_rule", "weighted") != "knee" else None
         state_path = folder / "state.json"
         state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {"probes": []}
+        all_attempts = [r for rows_c in state.get("results", {}).values() for r in rows_c] + list(state.get("probes") or [])
+        oom_attempts = [r for r in all_attempts if r.get("status") == "oom"]
+        oom_wasted = sum(float(r.get("worker_wall_seconds") or 0.0) for r in oom_attempts)
         outcome = {"run": str(folder), "method": p["method"], "search_seed": p["search_seed"],
                    "selected": key, "feasible": key is not None, "reference_feasibility_disagreement": key is not None and (not oracle_row or oracle_row["utility"] is None),
                    "objective_regret": regret, "selection_rule_regret": rule_regret, "online_seconds": report["online_session_seconds"],
                    "budget_seconds": p["budget_seconds"], "overrun_seconds": report["budget_overrun_seconds"],
-                   "checked_attempts": checked, "time_to_first_full_config_seconds": first_full_seconds(folder, p, rows),
+                   "checked_attempts": checked,
+                   "time_to_first_full_config_seconds": first_full_seconds(folder, p, rows),
                    "proxy_diagnostics": proxy_reference_diagnostics(state, p, reference)}
         extended = "detection_metric" in reference_protocol or tuple(int(x) for x in str(reference_protocol.get("implementation_version", "0.0.0")).split(".")[:2]) >= (0, 11)
         if extended:
             valid_oracle = oracle_row is not None and oracle_row["utility"] is not None
             traj = anytime_trajectory(folder, p, reference=reference)
+            max_mem = p["objective"].get("max_memory")
+            vram_viol_attempts = [
+                r for r in all_attempts
+                if r.get("status") == "oom" or (max_mem is not None and isinstance(r.get("memory_mb"), (int, float)) and float(r["memory_mb"]) > float(max_mem))
+            ]
             outcome.update(
                 selected_reference_quality=oracle_row["quality_mean"] if valid_oracle else None,
                 quality_regret=(best_quality_row["quality_mean"] - oracle_row["quality_mean"]) if best_quality_row and valid_oracle else None,
@@ -107,6 +118,11 @@ def compare(runs, reference_path, allow_controller_patch=False):
                 auarc=traj["auarc"],
                 time_to_target_95=traj["time_to_target_95"],
                 anytime_trajectory=traj["trajectory"],
+                oom_attempt_count=len(oom_attempts),
+                oom_wasted_seconds=oom_wasted,
+                conformal_pruned_count=len(state.get("conformal_pruned") or []),
+                vram_violation_attempt_count=len(vram_viol_attempts),
+                vram_violation_wasted_seconds=sum(float(r.get("worker_wall_seconds") or 0.0) for r in vram_viol_attempts),
             )
         outcomes.append(outcome)
     summaries = []
@@ -133,6 +149,11 @@ def compare(runs, reference_path, allow_controller_patch=False):
                 auarc_mean=statistics.mean(auarcs) if auarcs else None,
                 time_to_target_95_mean=statistics.mean(ttts) if ttts else None,
                 time_to_target_95_reached_count=len(ttts),
+                oom_attempts_mean=statistics.mean(r.get("oom_attempt_count", 0) for r in rows),
+                oom_wasted_seconds_mean=statistics.mean(r.get("oom_wasted_seconds", 0.0) for r in rows),
+                conformal_pruned_mean=statistics.mean(r.get("conformal_pruned_count", 0) for r in rows),
+                vram_violation_attempts_mean=statistics.mean(r.get("vram_violation_attempt_count", 0) for r in rows),
+                vram_violation_wasted_seconds_mean=statistics.mean(r.get("vram_violation_wasted_seconds", 0.0) for r in rows),
             )
         summaries.append(item)
     return {"schema_version": 1, "scope": "exploratory paired repeated search on one domain/hardware; not general superiority",
@@ -187,7 +208,8 @@ def benchmark(args):
                "--pin-memory", str(getattr(args, "pin_memory", "auto"))]
     if args.rungs:
         common += ["--rungs", *map(str, args.rungs)]
-    for flag, value in (("--grid", args.grid), ("--precision", args.precision), ("--max-memory", args.max_memory), ("--max-time", args.max_time), ("--predictor", args.predictor)):
+    for flag, value in (("--grid", args.grid), ("--precision", args.precision), ("--max-memory", args.max_memory), ("--max-time", args.max_time), ("--predictor", args.predictor),
+                        ("--conformal-vram-card", getattr(args, "conformal_vram_card", None)), ("--quality-tolerance", getattr(args, "quality_tolerance", None))):
         if value is not None:
             common += [flag, str(value)]
     if args.models:

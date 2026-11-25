@@ -2,6 +2,7 @@
 
 import math
 import random
+import statistics
 import time
 
 from yolo_tuner.research import Objective
@@ -18,7 +19,7 @@ ADAPTIVE_METHODS = (
     "adaptive_no_uncertainty",
     "adaptive_no_diversity",
 )
-METHODS = (*ADAPTIVE_METHODS, "reserve", "random", "default", "profile_all", "random_proxy", "quality_sh", "utility_sh", "no_reserve", "successive_halving", "prior_full")
+METHODS = (*ADAPTIVE_METHODS, "conformal_mf", "mf_no_conformal", "tpe_bo", "reserve", "random", "default", "profile_all", "random_proxy", "quality_sh", "utility_sh", "no_reserve", "successive_halving", "prior_full")
 
 
 def diversified_order(configs, seed):
@@ -165,9 +166,9 @@ def run_search(protocol, evaluate, remaining, ledger, initial=None, on_change=No
             if any(r.get("status") in {"oom", "config_mismatch", "training_evidence_missing"} for r in rows):
                 return
             cap = None
-            if protected and (method == "successive_halving" or method in ADAPTIVE_METHODS):
+            if protected and (method in {"successive_halving", "conformal_mf", "mf_no_conformal"} or method in ADAPTIVE_METHODS):
                 forecast = cost_model.estimate(i)
-                if policy_version >= 3:
+                if policy_version >= 3 and method != "mf_no_conformal":
                     risk_level, limit_mb, meas_mb = _memory_risk(forecast, objective, protocol, rows)
                     if risk_level in {"hard_exceeds_max_memory", "hard_exceeds_vram_free", "observed_seed_exceeded_max_memory", "observed_seed_exceeded_vram_free"}:
                         reason = ("observed seed memory exceeds effective memory limit; OOM/constraint risk guard"
@@ -446,6 +447,247 @@ def run_search(protocol, evaluate, remaining, ledger, initial=None, on_change=No
         # Avoid the generic one-pass scheduler; adaptive has already reacquired
         # after every complete configuration and stored its decision trace.
         order = []
+    if method == "tpe_bo":
+        # Deterministic Tree-Structured Parzen Estimator baseline over candidate hyperparameters.
+        from .selection import rule_scores
+        def _tpe_feats(idx):
+            c = configs[idx]
+            d = descriptor_for(protocol, c)
+            p_cnt = float(d.get("parameters") or 2_600_000.0)
+            return [
+                math.log(max(1.0, float(c.get("imgsz", 32)))),
+                math.log(max(1.0, float(c.get("batch", 1)))),
+                math.log(max(1e-8, float(c.get("lr0", 1e-3)))),
+                math.log1p(p_cnt),
+                float(c.get("precision") == "fp16"),
+                float(c.get("freeze", 0) or 0),
+                float(c.get("optimizer") == "SGD"),
+                math.log1p(float(c.get("width", 16) or 16)),
+            ]
+        raw_vecs = [_tpe_feats(i) for i in range(len(configs))]
+        n_dim = len(raw_vecs[0]) if raw_vecs else 0
+        norm_vecs = []
+        for idx in range(len(configs)):
+            vec = []
+            for d_i in range(n_dim):
+                col = [raw_vecs[j][d_i] for j in range(len(configs))]
+                lo, hi = min(col), max(col)
+                vec.append((raw_vecs[idx][d_i] - lo) / (hi - lo) if hi > lo + 1e-12 else 0.0)
+            norm_vecs.append(vec)
+
+        n_startup = max(2, min(3, max(1, len(configs) // 4)))
+        attempted = set()
+        while remaining() > cleanup:
+            rows = measurements(configs, state["results"], seeds, protocol["full_epochs"], objective)
+            scores_map, _ = rule_scores(rows, protocol)
+            obs_scores = {}
+            for r in rows:
+                idx = r["index"]
+                if r["state"] == "confirmed_feasible":
+                    obs_scores[idx] = float(scores_map.get(r["config_id"], r["utility"] or 0.0))
+                elif r["complete"] and r.get("quality_mean") is not None:
+                    obs_scores[idx] = -10.0 + float(r["quality_mean"])
+                elif any(ar.get("status") == "oom" for ar in r["runs"]):
+                    obs_scores[idx] = -100.0
+
+            candidates_left = [i for i in order if i not in attempted and missing(i)
+                               and not any(ar.get("status") in {"oom", "config_mismatch", "training_evidence_missing"} for ar in state["results"][str(i)])]
+            affordable = []
+            for i in candidates_left:
+                plan = cost_model.estimate(i)["planning_seconds"]
+                if plan is None or plan * len(missing(i)) + cleanup <= remaining():
+                    affordable.append(i)
+            if not affordable:
+                break
+
+            if len(obs_scores) < n_startup:
+                chosen = affordable[0]
+                tpe_reason = "tpe_startup_random"
+            else:
+                ranked_obs = sorted(obs_scores, key=lambda i: (obs_scores[i], -i), reverse=True)
+                n_good = max(1, min(len(ranked_obs) - 1, int(math.ceil(0.25 * len(ranked_obs)))))
+                good_idx = ranked_obs[:n_good]
+                bad_idx = ranked_obs[n_good:]
+
+                def _log_kde(x_vec, group_indices):
+                    if not group_indices:
+                        return 0.0
+                    log_p = 0.0
+                    m_g = float(len(group_indices))
+                    for d_i in range(n_dim):
+                        vals = [norm_vecs[g][d_i] for g in group_indices]
+                        std_d = max(0.18, statistics.stdev(vals) if len(vals) > 1 else 0.35)
+                        mix = sum(math.exp(-0.5 * ((x_vec[d_i] - v) / std_d) ** 2) / (std_d * 2.5066282746310002) for v in vals) / m_g
+                        log_p += math.log(max(1e-12, mix))
+                    return log_p
+
+                best_tpe = [(_log_kde(norm_vecs[i], good_idx) - _log_kde(norm_vecs[i], bad_idx), -order.index(i), i) for i in affordable]
+                best_tpe.sort(reverse=True)
+                chosen = best_tpe[0][2]
+                tpe_reason = "tpe_ei_kde_acquisition"
+
+            ledger.emit("tpe_bo_step", index=chosen, reason=tpe_reason, n_observed=len(obs_scores), remaining_seconds=remaining())
+            attempted.add(chosen)
+            confirm(chosen)
+        order = []
+
+    if method in {"conformal_mf", "mf_no_conformal"}:
+        from .conformal_vram import calibrate_online_2point, predict_conformal_vram
+        from .predictors import observed_cross_memory
+
+        use_conformal = method == "conformal_mf"
+        card = protocol.get("conformal_vram_card") if use_conformal else None
+        limit_mb, limit_kind = _effective_memory_limit(objective, protocol)
+        conformal_alpha = float(protocol.get("scheduler", {}).get("conformal_alpha", 0.05))
+        task_name = protocol.get("task", "detection")
+        pruned_set = {rec["index"] for rec in state.get("conformal_pruned", []) if isinstance(rec, dict) and "index" in rec}
+
+        def _record_pruned(idx, stage, pred_point, pred_upper, basis_str):
+            if idx in pruned_set:
+                return
+            pruned_set.add(idx)
+            rec = {
+                "index": idx,
+                "config_id": config_id(configs[idx]),
+                "stage": stage,
+                "predicted_point_mb": pred_point,
+                "upper_bound_mb": pred_upper,
+                "limit_mb": limit_mb,
+                "limit_kind": limit_kind,
+                "basis": basis_str,
+            }
+            state.setdefault("conformal_pruned", []).append(rec)
+            ledger.emit("conformal_vram_pruned", **rec)
+
+        # Stage 0: Pre-execution Conformal VRAM Filter
+        if use_conformal and card is not None and limit_mb is not None:
+            for idx in range(len(configs)):
+                pred = predict_conformal_vram(
+                    card, configs[idx], descriptor_for(protocol, configs[idx]),
+                    alpha=conformal_alpha, task=task_name, protocol=protocol,
+                )
+                if pred["upper_bound_mb"] > limit_mb:
+                    _record_pruned(idx, "stage0_offline_conformal", pred["point_mb"], pred["upper_bound_mb"], pred["basis"])
+
+        # Collect existing VRAM anchors for resume compatibility
+        online_anchors = []
+        for pr in state["probes"]:
+            if pr.get("status") == "ok" and isinstance(pr.get("memory_mb"), (int, float)) and math.isfinite(pr["memory_mb"]):
+                online_anchors.append({
+                    "config": configs[pr["index"]],
+                    "descriptor": descriptor_for(protocol, configs[pr["index"]]),
+                    "memory_mb": float(pr["memory_mb"]),
+                })
+        online_cal = calibrate_online_2point(card, online_anchors, task=task_name, protocol=protocol) if (use_conformal and card is not None and online_anchors) else None
+
+        # Stage 1: Multi-fidelity short-horizon probe screening
+        if use_conformal:
+            probe_order = sorted((i for i in order if i not in pruned_set), key=lambda i: (small_first_key(protocol, i), order.index(i)))
+        else:
+            probe_order = list(order)
+
+        mf_probe_fraction = max(float(protocol["scheduler"].get("probe_fraction", 0.1)), 0.42)
+        probe_allowance = protocol["budget_seconds"] * mf_probe_fraction
+        existing_probes = {r["index"]: r for r in state["probes"]}
+
+        for idx in probe_order:
+            if idx in existing_probes:
+                continue
+            if idx in pruned_set:
+                continue
+            if use_conformal and limit_mb is not None and online_anchors:
+                desc_i = descriptor_for(protocol, configs[idx])
+                if card is not None:
+                    pred_i = predict_conformal_vram(card, configs[idx], desc_i, alpha=conformal_alpha, online_cal=online_cal, task=task_name, protocol=protocol)
+                    if pred_i["upper_bound_mb"] > limit_mb:
+                        _record_pruned(idx, "stage1_online_calibrated_conformal", pred_i["point_mb"], pred_i["upper_bound_mb"], pred_i["basis"])
+                        continue
+                elif len(online_anchors) >= 2:
+                    merged_obs = {}
+                    for pr in state["probes"]:
+                        if pr.get("status") == "ok" and isinstance(pr.get("memory_mb"), (int, float)):
+                            merged_obs.setdefault(pr["index"], []).append(pr)
+                    for k_idx, k_rows in state["results"].items():
+                        ok_rows = [r for r in k_rows if r.get("status") == "ok" and isinstance(r.get("memory_mb"), (int, float))]
+                        if ok_rows:
+                            merged_obs.setdefault(int(k_idx), []).extend(ok_rows)
+                    mem_est = observed_cross_memory(protocol, merged_obs, idx)
+                    if mem_est and mem_est["point_mb"] * 1.12 > limit_mb:
+                        _record_pruned(idx, "stage1_online_physical_safety", mem_est["point_mb"], mem_est["point_mb"] * 1.12, mem_est["basis"])
+                        continue
+
+            valid_probe_count = sum(1 for r in state["probes"] if r.get("status") == "ok")
+            if probe_spent >= probe_allowance:
+                break
+            if valid_probe_count >= 2 and remaining() <= cleanup + 0.50 * protocol["budget_seconds"]:
+                break
+            cap = min(max(cleanup, probe_allowance - probe_spent + cleanup), remaining() - cleanup)
+            if cap < cleanup:
+                break
+            res = attempt(idx, seeds[0], False, cap, protocol["probe_epochs"])
+            if res is None:
+                break
+            if res.get("status") == "ok" and isinstance(res.get("memory_mb"), (int, float)) and math.isfinite(res["memory_mb"]):
+                if use_conformal:
+                    online_anchors.append({
+                        "config": configs[idx],
+                        "descriptor": descriptor_for(protocol, configs[idx]),
+                        "memory_mb": float(res["memory_mb"]),
+                    })
+                    if card is not None:
+                        online_cal = calibrate_online_2point(card, online_anchors, task=task_name, protocol=protocol)
+
+        # Rank screened candidates consistently with the locked selection rule
+        probe_by_idx = {}
+        for r in state["probes"]:
+            probe_by_idx[r["index"]] = r
+        weights = [w / sum(objective.weights) for w in objective.weights]
+        wt, wm = weights[1], weights[2]
+        valid_probes = []
+        failed_probes = set()
+        for idx, r in probe_by_idx.items():
+            if idx in pruned_set:
+                continue
+            mem = r.get("memory_mb")
+            q = r.get("quality")
+            if r.get("status") == "ok" and isinstance(q, (int, float)) and math.isfinite(q) and isinstance(mem, (int, float)) and math.isfinite(mem):
+                if limit_mb is not None and use_conformal and float(mem) > limit_mb:
+                    failed_probes.add(idx)
+                else:
+                    valid_probes.append((idx, r))
+            elif r.get("status") in {"oom", "config_mismatch", "training_evidence_missing"}:
+                failed_probes.add(idx)
+
+        max_probe_q = max((r["quality"] for _, r in valid_probes), default=0.0)
+        max_probe_t = max((max(1e-6, float(r.get("worker_wall_seconds", 1.0))) for _, r in valid_probes), default=1.0)
+        rule = protocol.get("selection_rule", "weighted")
+        eps_probe = max(0.05, float(protocol.get("quality_tolerance", 0.03)))
+
+        def _probe_rank_score(item):
+            idx, r = item
+            q = float(r["quality"])
+            t = max(1e-6, float(r.get("worker_wall_seconds", 1.0)))
+            m = float(r["memory_mb"])
+            est_full = cost_model.estimate(idx).get("point_seconds")
+            t_proxy = float(est_full) if isinstance(est_full, (int, float)) and math.isfinite(est_full) else (t / max_probe_t) * float(objective.time_scale)
+            if rule == "epsilon_constraint":
+                tl = t_proxy / float(objective.time_scale)
+                ml = m / float(objective.memory_scale)
+                denom_tm = wt + wm
+                c_cost = (wt * tl + wm * ml) / denom_tm if denom_tm > 1e-12 else 0.5 * (tl + ml)
+                gap = max(0.0, max_probe_q - q)
+                sc = (1.0 - c_cost / (1.0 + max(0.0, c_cost)) + 1e-4 * q) if gap <= eps_probe + 1e-12 else (-gap - 0.1 * c_cost / (1.0 + max(0.0, c_cost)))
+                return (sc, q, -idx)
+            u = objective.value({"quality_mean": q, "time_mean": t_proxy, "memory_max": m})
+            return (u, q, -idx)
+
+        promoted = [idx for idx, _ in sorted(valid_probes, key=_probe_rank_score, reverse=True)]
+        unprobed = [i for i in probe_order if i not in pruned_set and i not in promoted and i not in failed_probes]
+        order = promoted + unprobed
+        ledger.emit("conformal_mf_stage_summary", method=method, pruned=sorted(pruned_set),
+                    probed=list(probe_by_idx), promoted=promoted, online_calibration=online_cal)
+        save()
+
     if method == "prior_full":
         # Scheduling only. Missing/OOD predictions keep metadata order; every
         # selected candidate still requires all full-data seeds.

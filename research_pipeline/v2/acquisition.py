@@ -218,6 +218,19 @@ def _rule_evaluator(protocol, objective, observations):
 
     if rule == "weighted":
         return (lambda q, t, m: bounded(objective.value({"quality_mean": q, "time_mean": t, "memory_max": m}))), None
+    if rule == "epsilon_constraint":
+        eps = max(0.0, float(protocol.get("quality_tolerance", 0.03)))
+        q_star = max((float(obs["quality_mean"]) for obs in observations if obs.get("feasible")), default=0.0)
+        wt, wm = weights[1], weights[2]
+        denom_tm = wt + wm
+        def eps_val(q, t, m):
+            _, tl, ml = losses_of(q, t, m)
+            c_cost = (wt * tl + wm * ml) / denom_tm if denom_tm > 1e-12 else 0.5 * (tl + ml)
+            gap = max(0.0, q_star - float(q))
+            if gap <= eps + 1e-12:
+                return bounded(1.0 - (c_cost / (1.0 + max(0.0, c_cost))) + 1e-4 * float(q))
+            return bounded(-gap - 0.1 * (c_cost / (1.0 + max(0.0, c_cost))))
+        return eps_val, None
     if rule == "tchebycheff":
         return tcheb_val, None
     if rule == "topsis":

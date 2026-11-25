@@ -5,7 +5,7 @@ import math
 from .schema import decision
 from yolo_tuner.research import nondominated
 
-RULES = ("weighted", "tchebycheff", "topsis", "knee")
+RULES = ("weighted", "tchebycheff", "topsis", "knee", "epsilon_constraint")
 
 
 def rule_scores(rows, protocol):
@@ -18,6 +18,24 @@ def rule_scores(rows, protocol):
     losses = {r["config_id"]: (1 - r["quality_mean"], r["time_mean"] / obj["time_scale"], r["memory_max"] / obj["memory_scale"]) for r in feasible}
     if rule == "weighted":
         return {r["config_id"]: r["utility"] for r in feasible}, None
+    if rule == "epsilon_constraint":
+        if not feasible:
+            return {}, None
+        eps = max(0.0, float(protocol.get("quality_tolerance", 0.03)))
+        q_star = max(r["quality_mean"] for r in feasible)
+        wt, wm = weights[1], weights[2]
+        denom_tm = wt + wm
+        scores = {}
+        for r in feasible:
+            cid = r["config_id"]
+            _, t_loss, m_loss = losses[cid]
+            c_cost = (wt * t_loss + wm * m_loss) / denom_tm if denom_tm > 1e-12 else 0.5 * (t_loss + m_loss)
+            gap = max(0.0, q_star - r["quality_mean"])
+            if gap <= eps + 1e-12:
+                scores[cid] = 1.0 - (c_cost / (1.0 + max(0.0, c_cost))) + 1e-4 * r["quality_mean"]
+            else:
+                scores[cid] = -gap - 0.1 * (c_cost / (1.0 + max(0.0, c_cost)))
+        return scores, None
     if rule == "tchebycheff":
         return {k: -max(w * x for w, x in zip(weights, xs)) - 1e-6 * sum(w * x for w, x in zip(weights, xs)) for k, xs in losses.items()}, None
     if rule == "topsis":

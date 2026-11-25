@@ -1,0 +1,14 @@
+[
+  {"model": "weights/yolo11n.pt", "imgsz": 320, "batch": 4, "accumulation": 1, "precision": "fp16", "optimizer": "AdamW", "lr0": 0.0003, "weight_decay": 0.0005, "freeze": 5},
+  {"model": "weights/yolo11n.pt", "imgsz": 320, "batch": 8, "accumulation": 1, "precision": "fp16", "optimizer": "SGD",   "lr0": 0.005,  "weight_decay": 0.0005, "freeze": 0},
+  {"model": "weights/yolo11n.pt", "imgsz": 480, "batch": 4, "accumulation": 1, "precision": "fp16", "optimizer": "AdamW", "lr0": 0.001,  "weight_decay": 0.0005, "freeze": 0},
+  {"model": "weights/yolo11n.pt", "imgsz": 640, "batch": 4, "accumulation": 1, "precision": "fp16", "optimizer": "SGD",   "lr0": 0.005,  "weight_decay": 0.0005, "freeze": 0},
+  {"model": "weights/yolo26n.pt", "imgsz": 480, "batch": 4, "accumulation": 1, "precision": "fp16", "optimizer": "SGD",   "lr0": 0.005,  "weight_decay": 0.0005, "freeze": 0},
+  {"model": "weights/yolo26n.pt", "imgsz": 640, "batch": 4, "accumulation": 1, "precision": "fp16", "optimizer": "AdamW", "lr0": 0.001,  "weight_decay": 0.0005, "freeze": 0},
+  {"model": "weights/yolo11s.pt", "imgsz": 480, "batch": 4, "accumulation": 1, "precision": "fp16", "optimizer": "SGD",   "lr0": 0.005,  "weight_decay": 0.0005, "freeze": 0},
+  {"model": "weights/yolo11n.pt", "imgsz": 640, "batch": 8,  "accumulation": 1, "precision": "fp32", "optimizer": "SGD",   "lr0": 0.005,  "weight_decay": 0.0005, "freeze": 0},
+  {"model": "weights/yolo11n.pt", "imgsz": 640, "batch": 16, "accumulation": 1, "precision": "fp32", "optimizer": "AdamW", "lr0": 0.001,  "weight_decay": 0.0005, "freeze": 0},
+  {"model": "weights/yolo11s.pt", "imgsz": 640, "batch": 4,  "accumulation": 1, "precision": "fp32", "optimizer": "AdamW", "lr0": 0.001,  "weight_decay": 0.0005, "freeze": 0},
+  {"model": "weights/yolo11s.pt", "imgsz": 640, "batch": 8,  "accumulation": 1, "precision": "fp32", "optimizer": "SGD",   "lr0": 0.005,  "weight_decay": 0.0005, "freeze": 0},
+  {"model": "weights/yolo26n.pt", "imgsz": 800, "batch": 8,  "accumulation": 1, "precision": "fp32", "optimizer": "AdamW", "lr0": 0.001,  "weight_decay": 0.0005, "freeze": 0}
+]

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "studies": [
+    {
+      "path": "../runs/nckh_2027_study1_detection_vram_stress/20261125_235909_443762"
+    },
+    {
+      "path": "../runs/nckh_2027_study2_cifar10_cpu/20261126_010735_304786"
+    }
+  ],
+  "required_methods": [
+    "conformal_mf",
+    "mf_no_conformal",
+    "adaptive_full",
+    "tpe_bo",
+    "random",
+    "default"
+  ],
+  "bootstrap_seed": 2027,
+  "bootstrap_samples": 2000,
+  "confidence": 0.95
+}
