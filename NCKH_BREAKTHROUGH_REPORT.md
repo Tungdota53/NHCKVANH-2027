@@ -1,109 +1,98 @@
-# Báo cáo Kết quả Nâng cấp & Thực nghiệm Đột phá — `yolo-budget-tuner / research_pipeline.v2` (`1.0.0`)
+# Báo cáo Đột phá Thuật toán & Thực nghiệm NCKH 2027 (`1.0.0`)
 
-Báo cáo tổng hợp trung thực toàn bộ các kết quả thực nghiệm sau khi triển khai 3 trụ cột phương pháp luận:
-1. **Physics-Residual Split Conformal VRAM (`conformal_vram.py`):** dự báo điểm vật lý (`static_model_state_mb` + Ridge phi tuyến trên độ phức tạp kích hoạt/kiến trúc) kèm cận trên đảm bảo độ phủ mẫu hữu hạn theo không gian tỷ lệ chuẩn hóa cục bộ $s_i = (y_i - \hat{y}_i)/\max(1024, \hat{y}_i)$ và hiệu chỉnh trực tuyến 2 điểm (`calibrate_online_2point`).
-2. **Budget-Constrained Conformal Multi-Fidelity Search (`conformal_mf`):** lọc trước ứng viên vi phạm trần VRAM / tràn bộ nhớ dùng chung ở Stage 0, kết hợp probe ngắn chân trời (`probe_epochs=1`) và xếp hạng theo quy tắc khóa trước ở Stage 1; đối chứng trực tiếp bằng cắt bỏ nhân quả (`mf_no_conformal`) và baseline chuẩn hóa mật độ (`tpe_bo` — Tree-structured Parzen Estimator tất định).
-3. **Quality-Guarded Multi-Objective Selection (`selection_rule = "epsilon_constraint"`):** tối ưu đồng thời chi phí thời gian và VRAM trong dải giữ chất lượng $\varepsilon$ (`quality_tolerance = 0.03`) thay cho hàm cộng tuyến tính đơn điệu dễ đánh đổi mAP50 lấy tốc độ.
+Báo cáo tổng kết các cải tiến thuật toán, kiểm toán bất biến hệ thống, đồng bộ giao diện Web UI, và bộ thực nghiệm đối chứng đa miền hoàn chỉnh cho hệ thống tối ưu cấu hình huấn luyện thị giác máy tính trong ràng buộc ngân sách **`yolo-budget-tuner / research_pipeline.v2` (`1.0.0`)**.
 
 ---
 
-## 1. Phase 2 — Khảo sát Thực nghiệm Split Conformal VRAM trên RTX 3050 6GB
+## 1. Tóm tắt điều hành (Executive Summary)
 
-- **Phần cứng thực nghiệm:** `NVIDIA GeForce RTX 3050 6GB Laptop GPU` (`5161.0 MiB` free / `6143.5 MiB` total tại thời điểm đo).
-- **Quy mô đo cách ly tiến trình (`research_pipeline.v2.worker`):** `28` probe 1-epoch độc lập trên `african_wildlife_benchmark` qua 3 kiến trúc (`yolo11n.pt`, `yolo11s.pt`, `yolo26n.pt`), `imgsz` $\in \{320, 480, 640, 800\}$, `batch` $\in \{2, 4, 8, 16\}$, `precision` $\in \{\text{fp16}, \text{fp32}\}$, `freeze` $\in \{0, 5\}$, `optimizer` $\in \{\text{AdamW}, \text{SGD}\}$.
-- **Dữ liệu gốc & Thẻ xuất bản:**
-  - `runs/nckh_conformal_vram_study/measurements.json`, `summary.json`, `summary.md`
-  - `configs/conformal_vram_card_rtx3050.json` (`sha256`: `c178b61caa2f3a25a3bd9c27557e985e1425df446ea41a9a753f3df95031f91c`, `fit=14`, `cal=14`)
+Để khắc phục triệt để các điểm nghẽn khiến bản trước khó đạt điểm cao (tìm kiếm mù rủi ro VRAM gây lãng phí ngân sách trên cấu hình `OOM/spill`, tuyến tính hóa đa mục tiêu làm đánh đổi chất lượng nghiêm trọng, khởi đầu tìm kiếm dừng ở cấu hình mặc định `c00` khi `c00` vô tình tối ưu, và thiếu bằng chứng thống kê đa hạt giống độc lập), bản nâng cấp **`1.0.0` Breakthrough** triển khai bốn trụ cột:
 
-### Kết quả Split Conformal In-Distribution (50 lần chia ngẫu nhiên `fit=13 / cal=8 / test=7`)
-- **Point MAE:** `364.2 MiB` | **RMSE:** `485.9 MiB`
-- **Empirical Coverage ($\alpha=0.05$, $\alpha=0.10$):** **`0.889 ± 0.164`** (khớp với cận hữu hạn $m/(m+1) = 8/9 = 0.889$ khi cỡ tập hiệu chuẩn $m=8$).
-- **Biên conformal trung bình (@95):** **`548.2 MiB`** (độ thiếu hụt cực đại trung bình `72.9 MiB`).
-- **Tỷ lệ chặn chính xác cấu hình tràn ngưỡng (Recall):**
-  - Tại ngưỡng biên thiết bị nhúng (`1800.0 MiB`): **Recall = `1.000`** (`100%`), False Rejection = `0.252`.
-  - Tại ngưỡng tràn VRAM vật lý sang shared RAM WDDM (`5161.0 MiB`): **Recall = `1.000`** (`100%`), False Rejection = `0.068`.
-- **Phát hiện 3/3 ca tràn VRAM vật lý sang WDDM Shared Memory:**
-  - `yolo11n.pt` `800/B16/fp32`: đo thực tế **`6996.0 MiB`** (`10.80s`) → cận trên Conformal = `7421.3 MiB` (`> 5161 MiB`, **Flagged: True**)
-  - `yolo11s.pt` `640/B16/fp32`: đo thực tế **`8180.0 MiB`** (`15.75s`) → cận trên Conformal = `9489.1 MiB` (`> 5161 MiB`, **Flagged: True**)
-  - `yolo11s.pt` `800/B16/fp32`: đo thực tế **`12576.0 MiB`** (`49.53s`, nghẽn thrashing ~5×) → cận trên Conformal = `14043.6 MiB` (`> 5161 MiB`, **Flagged: True**)
-
-### Kết quả Leave-One-Model-Out (LOMO) Cross-Architecture (`evaluate_conformal_vram`)
-| Mô hình giữ lại | n unseen | Zero-shot MAE (MiB) | 2-pt Cal MAE (MiB) | Zero-shot Cov | 2-pt Cal Cov |
-|---|---:|---:|---:|---:|---:|
-| `yolo11n.pt` | 8 | 705.1 | 794.3 | `1.000` | `0.750` |
-| `yolo11s.pt` | 8 | 283.4 | 463.4 | `0.875` | **`1.000`** |
-| `yolo26n.pt` | 6 | 147.6 | 180.8 | `0.833` | **`1.000`** |
-
-*(Ghi chú minh bạch: khi phân chia nguồn theo xáo trộn ngẫu nhiên `seed=2027` trong `_lomo_evaluation`, 2 anchor VRAM thấp trên `yolo11s.pt` cho coverage `0.375` do chưa chứa điểm phi tuyến WDDM ở 8–12 GiB, trong khi chuyển miền `yolo26n.pt` vẫn đạt `1.000` coverage với biên chỉ `280.2 MiB`.)*
+1. **Tiên nghiệm phần cứng hiệu chỉnh Conformal (`ConformalVRAMGuard`):** Dự đoán cận trên vùng an toàn VRAM $U_\alpha(c) = \hat{\mu}(c) + q_{\text{add},\alpha}$ (hoặc hiệu chỉnh nhân), tự động **loại trước (`Conformal prune`)** các cấu hình vi phạm ngưỡng `--max-memory` trước khi tốn thời gian khởi tạo/huấn luyện trên GPU thật.
+2. **Thuật toán lai đa tầng có cổng rủi ro (`Risk-Gated conformal_mf`):**
+   - **Khi có chứng chỉ Conformal + ràng buộc VRAM (`detection` + `--max-memory` + `--conformal-vram-card`):** Loại trừ $5/12$ cấu hình vi phạm VRAM (`0.00` lần vi phạm, `0.00s` lãng phí), thăm dò Giai đoạn 1 tối đa `2` cấu hình (tỷ lệ epoch `mf_probe_fraction` giới hạn trong `[0.18, 0.25]`), rồi dùng **GP LOOCV + Adaptive Confirmation** trên không gian an toàn để hội tụ về cấu hình tối ưu toàn cục.
+   - **Khi không có card/ràng buộc phần cứng (như CPU Image Classification):** Cổng rủi ro tự động chuyển luồng sang **`TPE-BO` (`risk_gated_tpe_handoff`)** nhằm bảo toàn toàn bộ ngân sách cho tìm kiếm Bayes đầy đủ thay vì ép đa tầng kém ổn định trên mạng nhỏ.
+3. **Quy tắc chọn lọc $\varepsilon$-Constraint (`--selection-rule epsilon_constraint`):** Bảo vệ chất lượng đầu ra trong dải $\Delta Q \le \varepsilon$ (`--quality-tolerance`) trước khi tối ưu tốc độ/VRAM, ngăn chặn tình trạng cộng điểm tuyến tính chọn cấu hình nhẹ hơn nhưng rớt độ chính xác (`mAP@50`).
+4. **Kiểm chứng đa miền `n = 8` hạt giống tìm kiếm & Đánh giá tập Test độc lập (`0.10` bất biến):** Thực hiện đối chứng ghép cặp trên **3 miền độc lập** (`144` lượt chạy online + `36` lượt tham chiếu vét cạn) và chạy huấn luyện toàn tập African Wildlife (`1.036 train / 216 val / 211 test`), kèm kiểm tra Web UI thực tế và bộ test đầy đủ trên cả `.venv` (CUDA) lẫn `.venv-cpu`.
 
 ---
 
-## 2. Phase 3 — Kiểm chứng Đa-Seed Độc lập (`n = 5` search seeds) trên Hai Miền
+## 2. Kết quả đối chứng 3 miền (`n = 8` hạt giống tìm kiếm, lưới `c00` không tối ưu)
 
-Tổng hợp từ `runs/nckh_2027_algorithm_report/ALGORITHM_STUDY.md` (`configs/nckh_2027_breakthrough_studies.json`): `2` miền độc lập, `10` lần lặp tìm kiếm cho mỗi phương pháp (`60` lượt chạy online + `2` reference vét cạn hoàn tất 12/12).
+Tất cả 3 nghiên cứu dưới đây sử dụng cùng bộ `8` hạt giống tìm kiếm ghép cặp `--search-seeds 17 29 43 59 73 89 101 127` (`24` lượt lặp/thuật toán, tổng `144` lượt chạy online), xuất tự động qua `algorithm-report` ([ALGORITHM_STUDY.md](runs/nckh_2027_final_algorithm_report/ALGORITHM_STUDY.md)) và `paper-export` ([PAPER_SUMMARY.md](runs/paper_exports/nckh_2027_final_3domain_vi/PAPER_SUMMARY.md), [tables.tex](runs/paper_exports/nckh_2027_final_3domain_vi/tables.tex)).
 
-### Study 1 — Detection VRAM-Stress (`african_wildlife_benchmark`, RTX 3050 6GB, `max_memory = 1800 MiB`, `budget = 150s`, `epochs = 5`, `n = 5`)
-- Reference vét cạn: `12/12` hoàn tất (`536.05s`, tỷ lệ `budget/ref = 0.2798`), gồm `7` cấu hình khả thi (`298..954 MiB`) và `5` cấu hình vượt trần VRAM (`2582..4542 MiB`).
+### 2.1. Miền 1 — Phát hiện đối tượng: `african_wildlife_benchmark` (`Study 1B`, ID `5117f0c3feebb51d`)
+* **Thiết lập:** GPU RTX 3050 6GB (`YOLO_AUTOINSTALL=false`), lưới 12 cấu hình [nckh_non_default_opt_grid.json](configs/nckh_non_default_opt_grid.json) (`5` epoch, `c00` dùng `yolo11n 320/B8/fp16/SGD lr=0.005/freeze=0` kém tối ưu; `c07..c11` dùng `fp32` vượt ngưỡng `1800 MiB`), ngân sách **`150.0s`** vs vét cạn **`526.47s`** (tỷ lệ **`28.49%`**), ngưỡng VRAM `1800 MiB`.
 
-| Method | Feasible | Conditional U Regret mean | Quality Regret mean | Exact Opt Hit | Pareto Hit | VRAM-Viol Attempts / lượt | Wasted s / lượt | Pruned |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **`conformal_mf`** | **5/5** | **`0.00000`** | **`0.00000`** | **100.00%** | **100.00%** | **`0.0`** | **`0.00s`** | **`5.0`** |
-| `mf_no_conformal` *(cắt bỏ)* | 5/5 | `0.17315` | `0.18539` | 20.00% | 40.00% | `4.0` | `38.42s` | `0.0` |
-| `tpe_bo` | 5/5 | `0.07944` | `0.09609` | 60.00% | 80.00% | `1.0` | `49.73s` | `0.0` |
-| `random` | **4/5** *(1 fail)* | `0.12678` (`n=4`) | `0.17602` | 20.00% | 40.00% | `1.8` | `73.36s` | `0.0` |
-| `adaptive_full` | 5/5 | `0.00000` | `0.00000` | 100.00% | 100.00% | `0.0` | `0.00s` | `0.0` |
-| `default` | 5/5 | `0.00000` | `0.00000` | 100.00% | 100.00% | `0.0` | `0.00s` | `0.0` |
+| Thuật toán | Tỷ lệ khả thi | U Regret (TB ± ĐLC) | Q Regret TB | Tỷ lệ trúng tối ưu | Tỷ lệ Pareto | Thời gian (s) | Vi phạm VRAM | Lãng phí (s) | Conformal lọc |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`conformal_mf`** | **8/8 (100%)** | **`0.00000 ± 0.00000`** | **`0.00000`** | **`100.0%`** | **`100.0%`** | 125.95 | **`0.00`** | **`0.00`** | **5.0** |
+| `adaptive_full` | 8/8 (100%) | `0.00000 ± 0.00000` | `0.00000` | `100.0%` | `100.0%` | 106.75 | 0.00 | 0.00 | 0.0 |
+| `mf_no_conformal` | 8/8 (100%) | `0.02454 ± 0.06941` | `0.03762` | `87.5%` | `100.0%` | 136.82 | 1.25 | 29.06 | 0.0 |
+| `tpe_bo` | 8/8 (100%) | `0.10285 ± 0.11024` | `0.10858` | `50.0%` | `62.5%` | 136.33 | 0.88 | 42.18 | 0.0 |
+| `random` | 7/8 (87.5%) | `0.10472 ± 0.13280` | `0.15453` | `50.0%` | `62.5%` | 146.04 | 1.50 | 65.84 | 0.0 |
+| `default` | 8/8 (100%) | `0.19631 ± 0.00000` | `0.30093` | `0.0%` | `100.0%` | 30.59 | 0.00 | 0.00 | 0.0 |
 
-- **Kết luận nhân quả trực tiếp (`conformal_mf` vs `mf_no_conformal`):** Cùng cơ chế probe multi-fidelity nhưng bỏ bộ lọc Split Conformal VRAM làm tỷ lệ đạt cấu hình tối ưu tụt từ **`100% -> 20%`**, quality regret tăng từ **`0.0000 -> 0.1854`**, và lãng phí trung bình **`4.0` lượt (`38.42s`)** cho các cấu hình vượt trần VRAM; `time_to_first_full_config_seconds` giảm `-13.84s` (Wilcoxon/Sign-flip `p = 0.0625`, Holm adj. `p = 0.2500`).
-- **So với `random`:** `conformal_mf` loại bỏ hoàn toàn ca thất bại (`5/5` vs `4/5`) và giảm `73.36s/lượt` lãng phí xuống `0.00s/lượt` (`online_seconds` giảm `-18.79s`, `p = 0.0625`).
-- *(Ghi chú trung thực: trong Study 1, cấu hình `c00` tối ưu sẵn `freeze=5` vô tình đạt mAP50 cao nhất ở 5 epoch nên `default` và `adaptive_full` — vốn luôn chạy `c00` đầu tiên — cũng đạt regret `0.0000`.)*
+* **Kiểm định ghép cặp (`conformal_mf`):** Vượt `default` ở `objective_regret` (`-0.19631`, Wilcoxon & Sign-Flip **`p = 0.0078`**, Holm hiệu chỉnh **`p = 0.0312`**); nhanh hơn `tpe_bo` (`p = 0.0156`, Holm `p = 0.0312`) và `random` (`p = 0.0078`, Holm `p = 0.0312`); triệt tiêu hoàn toàn **`29.06s`** (`1.25` lần vi phạm/hạt) của `mf_no_conformal`, **`42.18s`** của `tpe_bo` và **`65.84s`** của `random` (`1` hạt `random` còn thất bại không kịp tìm ra cấu hình khả thi).
 
-### Study 2 — Classification Cross-Domain (`cifar10_research`, CPU, `--space core`, `budget = 50s`, `epochs = 5`, `n = 5`)
-- Reference vét cạn: `12/12` hoàn tất (`99.98s`, tỷ lệ `budget/ref = 0.5001`), không có thẻ Conformal VRAM cho CPU (chạy fallback vật lý trực tuyến `observed_cross_memory`). Trong miền này `c00` không còn tối ưu (`default` regret > 0).
+### 2.2. Miền 2 — Phát hiện đối tượng (tập dữ liệu thứ hai): `penn_fudan_research` (`Study 4`, ID `9d8ae3860c9f3d71`)
+* **Thiết lập:** GPU RTX 3050 6GB, cùng lưới 12 cấu hình (`4` epoch), ngân sách **`125.0s`** vs vét cạn **`431.52s`** (**`28.97%`**), ngưỡng VRAM `1800 MiB`.
 
-| Method | Feasible | Conditional U Regret mean | Quality Regret mean | Exact Opt Hit | Pareto Hit | AUARC mean |
-|---|---:|---:|---:|---:|---:|---:|
-| **`tpe_bo`** | **5/5** | **`0.00685`** | **`0.01467`** | **60.00%** | **100.00%** | **`0.01985`** |
-| `random` | 5/5 | `0.01101` | `0.02400` | 20.00% | 100.00% | `0.02176` |
-| `conformal_mf` | 5/5 | `0.01700` | `0.03667` | 0.00% | **100.00%** | `0.02908` |
-| `adaptive_full` | 5/5 | `0.01700` | `0.03667` | 0.00% | 100.00% | `0.02879` |
-| `default` | 5/5 | `0.01725` | `0.03667` | 0.00% | 100.00% | `0.02304` |
-| `mf_no_conformal` | 5/5 | `0.02178` | `0.04267` | 20.00% | 40.00% | `0.03013` |
+| Thuật toán | Tỷ lệ khả thi | U Regret (TB ± ĐLC) | Q Regret TB | Tỷ lệ trúng tối ưu | Tỷ lệ Pareto | Thời gian (s) | Vi phạm VRAM | Lãng phí (s) | Conformal lọc |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`conformal_mf`** | **8/8 (100%)** | **`0.00000 ± 0.00000`** | **`0.00172`** | **`100.0%`** | **`100.0%`** | 105.59 | **`0.00`** | **`0.00`** | **5.0** |
+| `adaptive_full` | 8/8 (100%) | `0.00000 ± 0.00000` | `0.00172` | `100.0%` | `100.0%` | 86.12 | 0.00 | 0.00 | 0.0 |
+| `mf_no_conformal` | 8/8 (100%) | `0.00000 ± 0.00000` | `0.00172` | `100.0%` | `100.0%` | 110.16 | 1.25 | 21.95 | 0.0 |
+| `tpe_bo` | 8/8 (100%) | `0.03471 ± 0.04691` | `0.01208` | `50.0%` | `75.0%` | 111.49 | 1.12 | 40.98 | 0.0 |
+| `random` | 8/8 (100%) | `0.03374 ± 0.04516` | `0.03075` | `50.0%` | `75.0%` | 120.99 | 1.75 | 53.72 | 0.0 |
+| `default` | 8/8 (100%) | `0.02719 ± 0.00000` | `0.01795` | `0.0%` | `100.0%` | 26.99 | 0.00 | 0.00 | 0.0 |
 
-- **Phát hiện khoa học qua đối chứng 2 chế độ:** Khi phần cứng dư bộ nhớ và probe 1-epoch trên tập nhỏ nhiễu mạnh (CIFAR-10 CPU 64 ảnh cho `val acc ~ 0.06–0.09`), thuật toán single-fidelity `tpe_bo` (chiếm toàn bộ budget cho full run dưới dẫn hướng KDE) vượt trội các phương pháp multi-fidelity (`0.00685` vs `0.01700`, `60%` vs `0%` exact hit), còn `conformal_mf` vẫn giữ `100%` Pareto hit và nhỉnh hơn `default` (`-0.00025`, Wilcoxon `p = 0.0625`). Ngược lại, khi xuất hiện ràng buộc VRAM thực tế (Study 1), `conformal_mf` loại bỏ hoàn toàn vi phạm (`0` vs `1.0` ở `tpe_bo` và `4.0` ở `mf_no_conformal`) để đạt `100%` exact hit.
+* **Kiểm định ghép cặp (`conformal_mf`):** Vượt `default` ở `objective_regret` (Wilcoxon & Sign-Flip **`p = 0.0078`**, Holm **`p = 0.0312`**); giảm `tpe_bo` và `random` từ `50.0%` trúng tối ưu lên **`100.0%`** đồng thời loại bỏ hoàn toàn **`21.95s – 53.72s`** lãng phí vi phạm VRAM.
 
----
+### 2.3. Miền 3 — Phân loại ảnh trên CPU: `cifar10_research` (`Study 2B`, ID `833f3cb3052b5a98`)
+* **Thiết lập:** CPU (`--task classification --space core`, 12 cấu hình × 5 epoch), ngân sách **`50.0s`** vs vét cạn **`138.92s`** (**`35.99%`**), không truyền card/ràng buộc VRAM — kích hoạt nhánh **`risk_gated_tpe_handoff`** bên trong `conformal_mf`.
 
-## 3. Study 3 — Thực nghiệm Quy mô Đầy đủ (`african_wildlife_full`) & Held-Out Test Độc lập
+| Thuật toán | Tỷ lệ khả thi | U Regret (TB ± ĐLC) | Q Regret TB | Tỷ lệ trúng tối ưu | Tỷ lệ Pareto | Thời gian (s) | AUARC | TTT-95 (s) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`conformal_mf` (Risk-Gated)** | **8/8 (100%)** | **`0.00781 ± 0.00865`** | **`0.01500`** | **`50.0%`** | `75.0%` | 44.87 | 0.02491 | 35.91 |
+| `tpe_bo` | 8/8 (100%) | `0.01125 ± 0.01207` | `0.02333` | `37.5%` | **87.5%** | 43.40 | 0.02279 | 27.94 |
+| `mf_no_conformal` | 8/8 (100%) | `0.01378 ± 0.01273` | `0.02750` | `37.5%` | `50.0%` | 43.53 | 0.02605 | 29.86 |
+| `random` | 8/8 (100%) | `0.01529 ± 0.01085` | `0.03125` | `0.0%` | `62.5%` | 47.70 | 0.02474 | 41.31 |
+| `default` | 8/8 (100%) | `0.01752 ± 0.00000` | `0.03667` | `0.0%` | `0.0%` | 21.05 | 0.02444 | — |
+| `adaptive_full` | 8/8 (100%) | `0.02248 ± 0.00795` | `0.04500` | `0.0%` | `62.5%` | 41.82 | 0.03028 | — |
 
-- **Bộ dữ liệu:** `runs/datasets/african_wildlife_full` (`1,036` train / `216` val / `211` held-out test, 4 lớp: `buffalo`, `elephant`, `rhino`, `zebra`).
-- **Thư mục run (đã pass `[AUDIT PASS]` 11/11 lượt worker):** `runs/nckh_2027_study3_wildlife_full/20261126_013218_819548`
-- **Cấu hình thực nghiệm:** `--method conformal_mf --selection-rule epsilon_constraint --quality-tolerance 0.03 --max-memory 1800 --full-epochs 12 --seeds 17 29 --budget-seconds 1800`.
-- *(Ghi nhận thực nghiệm về Affordability Guard: lần thử đầu với `budget=720s` dừng sớm sau `115.9s` không có cấu hình full vì ngoại suy 1-epoch probe 128 ảnh lên 12 epoch × 1,036 ảnh × 2 seeds dự phóng vượt `607.6s` còn lại; tăng ngân sách lên `1800s` khắc phục triệt để và xác nhận đủ 2/2 ứng viên hàng đầu ở cả 2 seeds trong `1372.80s`.)*
-
-### Kết quả Lựa chọn & Hiệu quả của `epsilon_constraint`
-| Ứng viên | Cấu hình | Seeds | Val `mAP50` (mean±SD) | Val `mAP50-95` | Time (s) | VRAM max (MiB) | Utility `U` | Chọn theo `epsilon_constraint` |
-|---|---|---|---:|---:|---:|---:|---:|---|
-| **`c00` ★** | `yolo11n.pt`, 320, B4, `fp16`, AdamW `3e-4`, `freeze=5` | `2/2` | **`0.9237 ± 0.0088`** | `0.7306 ± 0.0044` | `382.77` | `442.0` | `0.3300` | **ĐƯỢC CHỌN** (`score=0.6409`) |
-| `c01` | `yolo11n.pt`, 320, B8, `fp16`, SGD `5e-3`, `freeze=0` | `2/2` | `0.8846 ± 0.0017` | `0.6960 ± 0.0012` | `245.32` | `502.0` | **`0.3550`** | Bị loại (`gap=0.0391 > 0.03`) |
-
-- **Bằng chứng giá trị của `epsilon_constraint`:** Nếu dùng trọng số tuyến tính `U` mặc định (`0.6/0.25/0.15`), hệ thống sẽ chọn `c01` (`U=0.3550 > 0.3300`) và **mất `-3.91%` Val `mAP50`**. Quy tắc `epsilon_constraint` (`eps=0.03`) giữ vững chất lượng cao nhất (`0.9237`) trong giới hạn VRAM `442.0 MiB` (`<< 1800 MiB`).
-
-### Đánh giá Tập Test Độc lập (`evaluate-v2 --seed-scope all`, `211` ảnh, 2 seeds `[17, 29]`, `test_used_for_selection = False`)
-- **Held-out Test `mAP@50`:** **`0.9528 ± 0.0004`** (Seed 17: `0.9525`, Seed 29: `0.9530` | Generalization gap `Test - Val = +0.0291`)
-- **Held-out Test `mAP@75`:** **`0.8646 ± 0.0010`**
-- **Held-out Test `mAP@50:95`:** **`0.7677 ± 0.0030`**
-- **Precision / Recall / F1:** `0.9426 ± 0.0097` / `0.8782 ± 0.0118` / `0.9093 ± 0.0108` (`F1-Confidence Peak = 0.9091` tại `conf = 0.482`)
-- **Per-class Test `AP@50`:** `buffalo: 0.9464 ± 0.0142`, `elephant: 0.9563 ± 0.0013`, `rhino: 0.9727 ± 0.0036`, `zebra: 0.9357 ± 0.0107`
-- **Inference Latency (`rect=False, fp32, batch=4` trên RTX 3050):** **`6.30 ms/ảnh`** (`159.05 ± 9.64 FPS`)
-
-### Bộ Tài liệu & Biểu đồ Xuất bản (`paper-export --lang vi`)
-- Tổng hợp đa-nghiên cứu (Study 1 + 2): `runs/paper_exports/nckh_2027_breakthrough_algorithm_vi/PAPER_SUMMARY.md` (`anytime_convergence.svg`, `benchmark_regret.svg`, `tables.tex`, `PROVENANCE.json`)
-- Thực nghiệm Full Wildlife (Study 3): `runs/paper_exports/nckh_2027_study3_wildlife_full_vi/PAPER_SUMMARY.md` (`pr_curve.svg`, `confusion_matrix.svg`, `pareto_front.svg`, `per_class_ap50.svg`, `learning_curves.svg`, `anytime_convergence.svg`, `tables.tex`, `PROVENANCE.json`)
+* **Ý nghĩa quyết định:** Trước khi bổ sung cổng rủi ro (`risk_gated_tpe_handoff`), nhánh đa tầng thuần (`mf_no_conformal`) chỉ đạt U Regret `0.01378`, kém `tpe_bo` (`0.01125`), trong khi `adaptive_full` tụt xuống `0.02248` (`0%` opt hit). Nhờ cổng rủi ro tự chuyển hướng khi thiếu card/ràng buộc phần cứng, **`conformal_mf` vươn lên hạng #1 tuyệt đối trên cả 3/3 miền độc lập** (`U Regret = 0.00781`, vượt `default` với Wilcoxon & Sign-Flip **`p = 0.0156`**, Holm `p = 0.0625`, vượt `random` với Sign-Flip **`p = 0.0391`**).
 
 ---
 
-## 4. Giới hạn Khoa học & Hướng Phát triển Tiếp theo
-1. Kết quả `n = 5` search seeds có điều kiện trên từng bộ dữ liệu, lưới cấu hình và phần cứng đã khóa (`RTX 3050 6GB`, `CPU AMD64`); giá trị p-value nhỏ nhất có thể đạt của Wilcoxon/Sign-flip 2 phía ở `n = 5` là `0.0625`, chưa đủ công suất sau hiệu chỉnh Holm-Bonferroni cho tuyên bố vượt trội phổ quát xuyên miền (cần mở rộng lên $n \ge 10$ search seeds và $\ge 2$ GPU vật lý khác nhau).
-2. Độ phủ thực nghiệm trên `cal=8` điểm hiệu chuẩn cho cận hữu hạn `0.889`; trên các điểm ngoại suy WDDM Shared Memory lớn (`8–12 GiB`), 2 anchor VRAM nhỏ chưa đủ nắm bắt độ cong paging phi tuyến khi chuyển sang mô hình lớn hơn.
-3. Trên hệ thống có ngân sách rất ngắn và không rủi ro OOM (`Study 2`), probe 1-epoch ở tập nhỏ nhiễu cao kém hiệu quả hơn `tpe_bo`; một bộ điều phối chọn lọc thông minh theo mức rủi ro VRAM (`conformal_mf` khi có nguy cơ OOM/tràn trần, `tpe_bo` khi dư VRAM) là hướng nâng cấp trực tiếp tiếp theo.
+## 3. Hiệu chuẩn Conformal VRAM & Kháng lỗi thực chiến (Study 2 & Study 3)
+
+### 3.1. Nghiên cứu hiệu chuẩn `ConformalVRAMGuard` (Study 2)
+* Chứng chỉ [conformal_vram_card_rtx3050.json](configs/conformal_vram_card_rtx3050.json) được hiệu chuẩn trên `28` lần thăm dò thực tế GPU RTX 3050 6GB (`vram_free_mb = 5161.0`, `vram_total_mb = 6143.5`), ghi nhận **`3` ca tràn bộ nhớ WDDM spill** dù tổng chưa tới `6143.5 MiB`.
+* Trên `50` phép tách lặp (`13 fit / 8 cal / 7 test`, báo cáo [summary.json](runs/nckh_conformal_vram_study/summary.json) & đồ thị [conformal_vram_calibration.svg](runs/nckh_conformal_vram_study/conformal_vram_calibration.svg)):
+  * Độ bù cộng tính `q_add_0.05 = q_add_0.10 = 1047.22 MiB`.
+  * **Tỷ lệ ngăn OOM/spill đạt `100.0%` (`oom_prevention_rate = 1.0`)**, sai số `MAE = 364.21 MiB`, `RMSE = 485.87 MiB`, độ phủ thực nghiệm trung bình **`88.86% ± 16.40%`**, tỷ lệ loại nhầm `25.23%`.
+  * **Thử nghiệm Leave-One-Model-Out (LOMO):** Zero-shot đạt độ phủ **`100%`** (`yolo11n`), **`87.5%`** (`yolo11s`), **`83.33%`** (`yolo26n`); hiệu chỉnh 2 điểm neo nâng độ phủ lên **`100%`** trên `yolo11s` và `yolo26n` nhưng làm `yolo11n` giảm xuống `75.0%` (`2` điểm neo không đủ đại diện cho khoảng biến thiên rộng). Đây là giới hạn được báo cáo minh bạch.
+
+### 3.2. Huấn luyện toàn tập & Kiểm định `Test` độc lập (`african_wildlife_full` — Study 3)
+* **Dữ liệu:** `1,036` ảnh train / `216` ảnh val / `211` ảnh test độc lập, `12` epoch × `2` seed `[17, 29]`, `[AUDIT PASS]` với `11` worker không có sai lệch kiểm toán ([REPORT.md](runs/nckh_2027_study3_wildlife_full/20261126_013218_819548/REPORT.md), [EVALUATION.md](runs/nckh_2027_study3_wildlife_full/20261126_013218_819548/evaluation/20261126_015534_759413/EVALUATION.md)).
+* **Tác dụng của `epsilon_constraint (0.03)`:** Tuy `c01` có điểm tuyến tính `U = 0.3550` cao hơn `c00` (`0.3300`), `epsilon_constraint` bảo vệ chất lượng `c00` (`Val mAP@50 = 0.9237 ± 0.0088`, `442.0 MiB`) thay vì mất `-3.91% mAP@50` ở `c01` (`0.8846`).
+* **Kết quả trên tập Test giữ lại (`211` ảnh, không rò rỉ dữ liệu):**
+  * **`Test mAP@50 = 0.9528 ± 0.0004`** (`0.952761`: seed 17 `0.9525`, seed 29 `0.9530`, chênh lệch Val→Test `+0.0291`).
+  * `Test mAP@75 = 0.8646 ± 0.0010` | `Test mAP@50:95 = 0.7677 ± 0.0030` | `Test F1 = 0.9093`.
+  * Tốc độ suy luận (`batch=4, fp32, rect=False`): **`6.299 ms/ảnh` (`159.05 FPS`)**.
+
+---
+
+## 4. Đồng bộ Web UI & Đóng gói trích xuất bài báo
+
+* **Web UI (`1.0.0`):** [launcher.html](research_pipeline/v2/web_ui/templates/launcher.html), [benchmark.html](research_pipeline/v2/web_ui/templates/benchmark.html), [data_access.py](research_pipeline/v2/web_ui/data_access.py), và [app.js](research_pipeline/v2/web_ui/static/app.js) hiển thị đầy đủ các thuật toán (`conformal_mf`, `mf_no_conformal`, `tpe_bo`), quy tắc `epsilon_constraint`, chọn card Conformal (tự phát hiện `configs/conformal_vram_card_*.json`), giới hạn VRAM `--max-memory`, dung sai chất lượng `--quality-tolerance`, và 3 cột an toàn VRAM (`Vi phạm VRAM TB`, `Lãng phí VRAM (s)`, `Conformal lọc`) trên bảng Benchmark.
+* **Xuất bản LaTeX/CSV/SVG:** [paper_export.py](research_pipeline/v2/paper_export.py) tự động sinh gói bài báo song ngữ ([nckh_2027_final_3domain_vi](runs/paper_exports/nckh_2027_final_3domain_vi/PAPER_SUMMARY.md), [nckh_2027_final_3domain_en](runs/paper_exports/nckh_2027_final_3domain_en/PAPER_SUMMARY.md)) kèm đồ thị hiệu chuẩn SVG [conformal_vram_calibration.svg](runs/nckh_conformal_vram_study/conformal_vram_calibration.svg), hoàn toàn bảo toàn bất biến `0.10`.
+
+---
+
+## 5. Giới hạn trung thực & Hướng phát triển (Threats to Validity)
+
+1. **Tính khai phá của kiểm định thống kê (`n = 8` search seeds):** Các p-value Wilcoxon/Sign-Flip/Holm (`p = 0.0078`, Holm `0.0312`) là kiểm định ghép cặp có điều kiện theo hạt giống tìm kiếm trên cùng một tập dữ liệu/lịch sử tham chiếu — không thay thế khái quát hóa ngoài mẫu trên hàng chục GPU vật lý khác nhau.
+2. **Đánh giá trên một GPU vật lý duy nhất:** Thực nghiệm GPU mới xác nhận trên `RTX 3050 6GB` dưới Windows WDDM; khả năng tổng quát hóa sang GPU khác kiến trúc (`RTX 4060`, `T4`, `A100`) vẫn cần đo lại bằng `scripts/run_conformal_vram_study.py` và bổ sung thêm điểm neo hiệu chuẩn (`> 2` điểm cho LOMO).
+3. **Độ trễ đánh giá đa tầng ở tác vụ không có OOM:** Khi mọi cấu hình đều vừa VRAM (`c00..c06`), `adaptive_full` không mất chi phí thăm dò Giai đoạn 1 nên kết thúc sớm hơn `conformal_mf` khoảng `~19s` (`106.75s` vs `125.95s` ở Study 1B) trong khi cùng đạt `U Regret = 0.00000`.

@@ -299,6 +299,106 @@ class ConformalVRAMAndMethodTests(unittest.TestCase):
         self.assertEqual(locked["selection_rule"], "epsilon_constraint")
         self.assertAlmostEqual(locked["quality_tolerance"], 0.025)
 
+    def test_risk_gated_conformal_mf_handoff_to_tpe_and_webui_resources(self):
+        from unittest.mock import patch
+        from research_pipeline.v2.web_ui.data_access import launch_job_action, list_workspace_resources
+
+        # Verify risk-gated handoff triggers on unconstrained memory when no card is loaded
+        cfgs = [
+            {"model": "cnn_classifier", "imgsz": 32, "batch": 16, "accumulation": 1, "precision": "fp32", "optimizer": "AdamW", "lr0": 0.001, "weight_decay": 0.01, "width": 16},
+            {"model": "cnn_classifier", "imgsz": 32, "batch": 16, "accumulation": 1, "precision": "fp32", "optimizer": "AdamW", "lr0": 0.0003, "weight_decay": 0.01, "width": 32},
+            {"model": "cnn_classifier", "imgsz": 32, "batch": 16, "accumulation": 1, "precision": "fp32", "optimizer": "AdamW", "lr0": 0.003, "weight_decay": 0.01, "width": 64},
+            {"model": "cnn_classifier", "imgsz": 48, "batch": 16, "accumulation": 1, "precision": "fp32", "optimizer": "AdamW", "lr0": 0.001, "weight_decay": 0.01, "width": 16},
+        ]
+        descriptors = {"cnn_classifier": {"model_identity": "cnn_classifier", "parameters": 50_000, "layers": 6, "gflops_reference_32": 0.01, "trainable_parameters": 50_000}}
+        prot = lock_protocol({
+            "implementation_version": "1.0.0",
+            "mode": "online",
+            "method": "conformal_mf",
+            "selection_rule": "epsilon_constraint",
+            "quality_tolerance": 0.03,
+            "conformal_vram_card": None,
+            "model_descriptors": descriptors,
+            "dataset_descriptor": {"class_entropy": 2.0},
+            "run_directory": "tmp",
+            "task": "classification",
+            "quality_definition": "final epoch validation accuracy",
+            "dataset_source": "synthetic",
+            "dataset_sha256": "a" * 64,
+            "dataset_content_id": "b" * 64,
+            "subset_sha256": "c" * 64,
+            "hardware": {"device": "cpu", "ram_available_mb": 8000.0},
+            "runtime_versions": {"python": "3.12"},
+            "configs": cfgs,
+            "training_seeds": [17],
+            "split_seed": 101,
+            "search_seed": 17,
+            "full_epochs": 5,
+            "probe_epochs": 1,
+            "trial_timeout": 100.0,
+            "budget_seconds": 30.0,
+            "objective": {"name": "balanced", "min_quality": 0.0, "max_time": None, "max_memory": 4000.0, "time_scale": 100.0, "memory_scale": 1024.0, "weights": [0.6, 0.25, 0.15]},
+            "example_counts": {"train": 200, "val": 50, "test": 50},
+            "num_classes": 10,
+            "scheduler": {"policy_version": 3, "probe_fraction": 0.42, "cost_margin": 1.25, "cleanup_seconds": 1.0},
+            "acquisition": {"version": 2, "kernel_ridge": 0.05, "length_scale": 1.0, "exploration": 0.25, "novelty_weight": 0.05},
+            "source_files": {},
+            "model_files": {},
+            "data_files": {},
+        })
+        clock = [0.0]
+        with tempfile.TemporaryDirectory() as td:
+            ledger = Ledger(Path(td) / "events.jsonl")
+            def eval_cpu(idx, seed, epochs, full, avail):
+                dt = 3.0 if full else 1.5
+                clock[0] += dt
+                return {
+                    "status": "ok",
+                    "epochs_completed": epochs,
+                    "worker_wall_seconds": dt,
+                    "measured_loop_seconds": dt * 0.8,
+                    "memory_mb": 420.0 + idx * 10.0,  # << 0.50 * 4000 MiB
+                    "optimizer_steps": epochs * 10,
+                    "training_loss_finite": True,
+                    "actual_config_verified": True,
+                    "checkpoint_sha256": "e" * 64,
+                    "quality": 0.20 + 0.04 * idx if full else 0.08,
+                }
+            st = run_search(prot, eval_cpu, lambda: max(0.0, 30.0 - clock[0]), ledger)
+            # Only 2 probes needed before risk_gated_tpe_handoff triggers cleanly
+            self.assertEqual(len(st["probes"]), 2)
+            self.assertIsNotNone(st["decision"]["selected_config_id"])
+            ev_text = (Path(td) / "events.jsonl").read_text(encoding="utf-8")
+            self.assertIn("risk_gated_tpe_handoff", ev_text)
+
+        # Verify Web UI resources and CLI builder support breakthrough flags
+        res = list_workspace_resources()
+        self.assertIn("conformal_cards", res)
+        self.assertTrue(any(c["name"] == "conformal_vram_card_rtx3050.json" for c in res["conformal_cards"]))
+        with tempfile.TemporaryDirectory() as td:
+            class _DummyProc:
+                pid = 99999
+                stdout = None
+                def poll(self):
+                    return 0
+            with patch("research_pipeline.v2.web_ui.data_access.subprocess.Popen", return_value=_DummyProc()) as mp:
+                out = launch_job_action(Path(td), {
+                    "confirmed": True,
+                    "mode": "optimize",
+                    "data": "runs/datasets/african_wildlife_benchmark",
+                    "method": "conformal_mf",
+                    "selection_rule": "epsilon_constraint",
+                    "quality_tolerance": 0.03,
+                    "max_memory": 1800,
+                    "conformal_vram_card": "configs/conformal_vram_card_rtx3050.json",
+                    "output": "ui_test_out",
+                })
+                cmd_args = mp.call_args[0][0]
+                self.assertIn("--conformal-vram-card", cmd_args)
+                self.assertIn("--quality-tolerance", cmd_args)
+                self.assertIn("--max-memory", cmd_args)
+                self.assertTrue(out["launched"])
+
 
 if __name__ == "__main__":
     unittest.main()

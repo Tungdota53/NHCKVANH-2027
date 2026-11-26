@@ -340,7 +340,9 @@ def main():
             c = oc["config"]
             lines.append(f"| #{oc['index']} | {Path(c['model']).name} | {c['imgsz']}/{c['batch']}/{c['precision']} | {oc['observed_memory_mb']:.1f} | {oc['wall_seconds']:.2f} | {oc['predicted_point_mb']:.1f} | {oc['upper_bound_95_mb']:.1f} | {oc['exceeds_vram_free']} |")
     (out_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"\n[Phase 2 DONE] Summary written to {out_dir / 'summary.md'}", flush=True)
+    from research_pipeline.v2.paper_export import export_conformal_vram_svg
+    svg_path = export_conformal_vram_svg(measurements, card, out_dir / "conformal_vram_calibration.svg", vram_free_mb=vram_free_mb, edge_limit_mb=1800.0, lang="vi")
+    print(f"\n[Phase 2 DONE] Summary written to {out_dir / 'summary.md'} | Plot: {svg_path}", flush=True)
 
 
 if __name__ == "__main__":

@@ -412,6 +412,9 @@
     const modelSel = document.getElementById("launch-models");
     const methodSel = document.getElementById("launch-method");
     const ruleSel = document.getElementById("launch-rule");
+    const cardSel = document.getElementById("launch-conformal-card");
+    const tolInput = document.getElementById("launch-quality-tolerance");
+    const maxMemInput = document.getElementById("launch-max-memory");
     const spaceSel = document.getElementById("launch-space");
     const epochsInput = document.getElementById("launch-epochs");
     const budgetInput = document.getElementById("launch-budget");
@@ -472,11 +475,32 @@
       if (!isLikelyDetectionData()) modelSel.value = "";
     }
 
+    const METHOD_LABELS = {
+      conformal_mf: "conformal_mf (Split Conformal VRAM + Multi-Fidelity · Risk-Gated)",
+      mf_no_conformal: "mf_no_conformal (Multi-Fidelity không lọc Conformal)",
+      tpe_bo: "tpe_bo (Bayesian Optimization TPE · KDE Parzen)",
+      adaptive_full: "adaptive_full (GP Kernel Ridge LOOCV · Full-data)",
+      adaptive_ehvi: "adaptive_ehvi (3D Pareto Hypervolume EHVI)",
+      adaptive_staged_seeds: "adaptive_staged_seeds (Đo tuần tự seed dẫn đầu)",
+      random: "random (Ngẫu nhiên có kiểm soát)",
+      default: "default (Chỉ cấu hình c00 mặc định)",
+    };
+    const RULE_LABELS = {
+      epsilon_constraint: "epsilon_constraint (Tối ưu tốc độ/VRAM trong ngưỡng giữ chất lượng ε)",
+      weighted: "weighted (Tổng trọng số cân bằng U)",
+      tchebycheff: "tchebycheff (Min-max khoảng cách Chebyshev)",
+      topsis: "topsis (Gần điểm lý tưởng TOPSIS)",
+      knee: "knee (Điểm khuỷu Pareto tự động)",
+    };
     if (methodSel && resData.methods) {
-      methodSel.innerHTML = resData.methods.map((m) => `<option value="${esc(m)}" ${m === "adaptive_full" ? "selected" : ""}>${esc(m)}</option>`).join("");
+      methodSel.innerHTML = resData.methods.map((m) => `<option value="${esc(m)}" ${m === "conformal_mf" ? "selected" : ""}>${esc(METHOD_LABELS[m] || m)}</option>`).join("");
     }
     if (ruleSel && resData.rules) {
-      ruleSel.innerHTML = resData.rules.map((r) => `<option value="${esc(r)}">${esc(r)}</option>`).join("");
+      ruleSel.innerHTML = resData.rules.map((r) => `<option value="${esc(r)}" ${r === "epsilon_constraint" ? "selected" : ""}>${esc(RULE_LABELS[r] || r)}</option>`).join("");
+    }
+    if (cardSel) {
+      const cards = resData.conformal_cards || [];
+      cardSel.innerHTML = `<option value="">(Tự động hiệu chỉnh online khi không chọn thẻ)</option>` + cards.map((c) => `<option value="${esc(c.path)}">${esc(c.name)} (${esc(c.path)})</option>`).join("");
     }
 
     function selectedModelsList() {
@@ -488,8 +512,11 @@
     function readPayload(confirmed) {
       const mode = document.getElementById("launch-mode").value;
       const modelsVal = selectedModelsList();
-      const selectedMethod = methodSel.value || "adaptive_full";
-      const bmMethods = Array.from(new Set([selectedMethod, "adaptive_full", "adaptive_ehvi", "random"]));
+      const selectedMethod = methodSel.value || "conformal_mf";
+      const bmMethods = Array.from(new Set([selectedMethod, "conformal_mf", "mf_no_conformal", "adaptive_full", "tpe_bo", "random"]));
+      const cardVal = cardSel ? cardSel.value.trim() : "";
+      const tolRaw = tolInput ? tolInput.value.trim() : "";
+      const maxMemRaw = maxMemInput ? maxMemInput.value.trim() : "";
       return {
         mode,
         data: dataInput.value.trim(),
@@ -498,6 +525,9 @@
         method: selectedMethod,
         methods: mode === "benchmark" ? bmMethods : undefined,
         selection_rule: ruleSel.value,
+        quality_tolerance: tolRaw !== "" ? Number(tolRaw) : undefined,
+        max_memory: maxMemRaw !== "" ? Number(maxMemRaw) : undefined,
+        conformal_vram_card: cardVal || undefined,
         detection_metric: document.getElementById("launch-metric").value,
         full_epochs: Number((epochsInput && epochsInput.value) || 5),
         budget_seconds: Number((budgetInput && budgetInput.value) || 600),
@@ -573,6 +603,9 @@
         parts.push("--method", p.method);
       }
       if (p.models.length) parts.push("--models", ...p.models);
+      if (p.conformal_vram_card) parts.push("--conformal-vram-card", `"${p.conformal_vram_card}"`);
+      if (typeof p.quality_tolerance === "number" && Number.isFinite(p.quality_tolerance)) parts.push("--quality-tolerance", String(p.quality_tolerance));
+      if (typeof p.max_memory === "number" && Number.isFinite(p.max_memory)) parts.push("--max-memory", String(p.max_memory));
       previewEl.textContent = parts.join(" ");
       updateBudgetAdvisory(p);
     }
@@ -618,7 +651,8 @@
       "launch-dataset-select", "launch-data", "launch-device", "launch-mode",
       "launch-space", "launch-models", "launch-method", "launch-rule",
       "launch-metric", "launch-epochs", "launch-budget", "launch-seeds",
-      "launch-weights", "launch-output",
+      "launch-weights", "launch-conformal-card", "launch-quality-tolerance",
+      "launch-max-memory", "launch-output",
     ].forEach((id) => {
       const el = document.getElementById(id);
       if (el) {
@@ -945,6 +979,9 @@
               <td class="num">${fmt(s.pareto_hit_rate, 2)}</td>
               <td class="num">${fmt(s.auarc_mean, 5)}</td>
               <td class="num">${fmt(s.online_seconds_mean, 1)}s</td>
+              <td class="num">${typeof s.vram_violation_attempts_mean === "number" ? fmt(s.vram_violation_attempts_mean, 2) : "—"}</td>
+              <td class="num">${typeof s.vram_violation_wasted_seconds_mean === "number" ? fmt(s.vram_violation_wasted_seconds_mean, 1) + "s" : "—"}</td>
+              <td class="num">${typeof s.conformal_pruned_mean === "number" ? fmt(s.conformal_pruned_mean, 1) : "—"}</td>
             </tr>
           `).join("");
           pairedBody.innerHTML = (bm.outcomes || []).map((o) => `
@@ -970,18 +1007,33 @@
             const domainTask = study.domain && study.domain.task ? ` (${study.domain.task})` : "";
             const studyLabel = `Nghiên cứu ${sIdx + 1}: ${shortName}${domainTask}`;
             if (studies.length > 1) {
-              sumRowsHtml.push(`<tr class="study-group-row"><td colspan="8"><strong>${esc(studyLabel)}</strong></td></tr>`);
+              sumRowsHtml.push(`<tr class="study-group-row"><td colspan="11"><strong>${esc(studyLabel)}</strong></td></tr>`);
             }
+            const outcomesByMethod = {};
+            (study.outcomes || []).forEach((o) => {
+              (outcomesByMethod[o.method] = outcomesByMethod[o.method] || []).push(o);
+            });
             (study.method_summaries || []).forEach((s) => {
+              const mOuts = outcomesByMethod[s.method] || [];
+              const qRegs = mOuts.map((o) => o.quality_regret).filter((v) => typeof v === "number" && Number.isFinite(v));
+              const parHits = mOuts.map((o) => o.pareto_hit).filter((v) => typeof v === "boolean");
+              const auarcs = mOuts.map((o) => o.auarc).filter((v) => typeof v === "number" && Number.isFinite(v));
+              const viols = mOuts.map((o) => o.vram_violation_attempt_count).filter((v) => typeof v === "number" && Number.isFinite(v));
+              const wastes = mOuts.map((o) => o.vram_violation_wasted_seconds).filter((v) => typeof v === "number" && Number.isFinite(v));
+              const pruns = mOuts.map((o) => o.conformal_pruned_count).filter((v) => typeof v === "number" && Number.isFinite(v));
+              const meanArr = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
               const row = {
                 method: studies.length > 1 ? `S${sIdx + 1}: ${s.method}` : s.method,
                 n: s.search_repetitions,
                 feasibility_rate: s.feasibility_rate,
                 conditional_regret_mean: s.conditional_objective_regret && s.conditional_objective_regret.mean,
-                conditional_quality_regret_mean: null,
-                pareto_hit_rate: null,
-                auarc_mean: null,
+                conditional_quality_regret_mean: meanArr(qRegs),
+                pareto_hit_rate: parHits.length ? parHits.filter(Boolean).length / parHits.length : null,
+                auarc_mean: meanArr(auarcs),
                 online_seconds_mean: s.online_seconds && s.online_seconds.mean,
+                vram_violation_attempts_mean: meanArr(viols),
+                vram_violation_wasted_seconds_mean: meanArr(wastes),
+                conformal_pruned_mean: meanArr(pruns),
               };
               chartSums.push(row);
               sumRowsHtml.push(`
@@ -990,10 +1042,13 @@
                   <td class="num">${esc(row.n)}</td>
                   <td class="num">${fmt(row.feasibility_rate, 2)}</td>
                   <td class="num">${fmt(row.conditional_regret_mean, 5)}</td>
-                  <td class="num">—</td>
-                  <td class="num">—</td>
-                  <td class="num">—</td>
+                  <td class="num">${fmt(row.conditional_quality_regret_mean, 5)}</td>
+                  <td class="num">${fmt(row.pareto_hit_rate, 2)}</td>
+                  <td class="num">${fmt(row.auarc_mean, 5)}</td>
                   <td class="num">${fmt(row.online_seconds_mean, 1)}s</td>
+                  <td class="num">${row.vram_violation_attempts_mean !== null ? fmt(row.vram_violation_attempts_mean, 2) : "—"}</td>
+                  <td class="num">${row.vram_violation_wasted_seconds_mean !== null ? fmt(row.vram_violation_wasted_seconds_mean, 1) + "s" : "—"}</td>
+                  <td class="num">${row.conformal_pruned_mean !== null ? fmt(row.conformal_pruned_mean, 1) : "—"}</td>
                 </tr>
               `);
             });
@@ -1011,11 +1066,11 @@
             });
           });
           window.NCKHCharts.renderBenchmarkChart(document.getElementById("chart-benchmark"), chartSums);
-          sumBody.innerHTML = sumRowsHtml.join("") || `<tr><td colspan="8">Không có dữ liệu tổng hợp theo phương pháp.</td></tr>`;
+          sumBody.innerHTML = sumRowsHtml.join("") || `<tr><td colspan="11">Không có dữ liệu tổng hợp theo phương pháp.</td></tr>`;
           pairedBody.innerHTML = pairedRowsHtml.join("") || `<tr><td colspan="7">Không có kiểm định ghép cặp.</td></tr>`;
         }
       } catch (err) {
-        sumBody.innerHTML = `<tr><td colspan="8">${esc(err.message)}</td></tr>`;
+        sumBody.innerHTML = `<tr><td colspan="11">${esc(err.message)}</td></tr>`;
       }
     }
 

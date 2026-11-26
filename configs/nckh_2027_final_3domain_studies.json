@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "studies": [
+    {
+      "path": "../runs/nckh_2027_study1b_wildlife_n8/20261126_100756_382810"
+    },
+    {
+      "path": "../runs/nckh_2027_study4_pennfudan_n8/20261126_114837_689197"
+    },
+    {
+      "path": "../runs/nckh_2027_study2b_cifar10_n8/20261126_131137_681025"
+    }
+  ],
+  "required_methods": [
+    "conformal_mf",
+    "mf_no_conformal",
+    "adaptive_full",
+    "tpe_bo",
+    "random",
+    "default"
+  ],
+  "bootstrap_seed": 2027,
+  "bootstrap_samples": 2000,
+  "confidence": 0.95
+}

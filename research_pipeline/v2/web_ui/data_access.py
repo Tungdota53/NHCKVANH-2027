@@ -628,13 +628,18 @@ def list_workspace_resources():
     weights = scan_weights(REPO_ROOT / "weights")
     configs_dir = REPO_ROOT / "configs"
     configs = []
+    conformal_cards = []
     if configs_dir.is_dir():
         for p in sorted(configs_dir.glob("*.json"), key=lambda x: x.name.lower()):
-            configs.append({"name": p.name, "path": str(p.relative_to(REPO_ROOT).as_posix())})
+            entry = {"name": p.name, "path": str(p.relative_to(REPO_ROOT).as_posix())}
+            configs.append(entry)
+            if "conformal" in p.name.lower():
+                conformal_cards.append(entry)
     return {
         "datasets": datasets,
         "weights": weights,
         "configs": configs,
+        "conformal_cards": conformal_cards,
         "methods": list(METHODS),
         "rules": list(RULES),
         "tasks": sorted(TASKS),
@@ -946,7 +951,7 @@ def launch_job_action(runs_root, payload: dict):
         "--output", str(out_dir),
     ]
     if mode == "benchmark":
-        raw_methods = payload["methods"] if "methods" in payload and payload["methods"] is not None else ["adaptive_full", "adaptive_ehvi", "random"]
+        raw_methods = payload["methods"] if "methods" in payload and payload["methods"] is not None else ["conformal_mf", "mf_no_conformal", "adaptive_full", "tpe_bo", "random"]
         if isinstance(raw_methods, bool):
             raise ValueError("methods cannot be a boolean")
         if isinstance(raw_methods, str):
@@ -1012,6 +1017,40 @@ def launch_job_action(runs_root, payload: dict):
             raise ValueError("Grid path cannot start with '-'")
         if grid_str:
             cli_args += ["--grid", str(resolve_dataset_input(grid_str))]
+
+    raw_card = payload.get("conformal_vram_card")
+    if raw_card is not None and raw_card != "":
+        if not isinstance(raw_card, str):
+            raise ValueError(f"Invalid conformal_vram_card: {raw_card!r}")
+        card_str = raw_card.strip()
+        if card_str.startswith("-"):
+            raise ValueError("Conformal VRAM card path cannot start with '-'")
+        if card_str:
+            cli_args += ["--conformal-vram-card", str(resolve_dataset_input(card_str))]
+
+    raw_tol = payload.get("quality_tolerance")
+    if raw_tol is not None and raw_tol != "":
+        if isinstance(raw_tol, bool):
+            raise ValueError("quality_tolerance cannot be a boolean")
+        try:
+            tol_val = float(raw_tol)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid quality_tolerance: {raw_tol!r}") from exc
+        if not math.isfinite(tol_val) or not 0.0 <= tol_val <= 1.0:
+            raise ValueError("quality_tolerance must be finite and in [0, 1]")
+        cli_args += ["--quality-tolerance", str(tol_val)]
+
+    raw_max_mem = payload.get("max_memory")
+    if raw_max_mem is not None and raw_max_mem != "":
+        if isinstance(raw_max_mem, bool):
+            raise ValueError("max_memory cannot be a boolean")
+        try:
+            mm_val = float(raw_max_mem)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid max_memory: {raw_max_mem!r}") from exc
+        if not math.isfinite(mm_val) or mm_val <= 0.0:
+            raise ValueError("max_memory must be finite and > 0")
+        cli_args += ["--max-memory", str(mm_val)]
 
     cmd = [sys.executable, "-m", "research_pipeline.v2", *cli_args]
     preview = " ".join(cmd)

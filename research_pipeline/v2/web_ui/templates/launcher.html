@@ -110,7 +110,7 @@
           <select id="launch-rule"></select>
         </div>
       </div>
-      <div class="form-row" style="margin-bottom:0;">
+      <div class="form-row">
         <div>
           <label for="launch-metric">Chỉ số chính (Detection)</label>
           <select id="launch-metric">
@@ -125,6 +125,22 @@
         <div>
           <label for="launch-weights">Trọng số mục tiêu (Chất lượng · Thời gian · VRAM)</label>
           <input id="launch-weights" type="text" value="0.6 0.25 0.15" />
+        </div>
+      </div>
+      <div class="form-row" style="margin-bottom:0;">
+        <div>
+          <label for="launch-conformal-card">Thẻ Split Conformal VRAM (.json)</label>
+          <select id="launch-conformal-card">
+            <option value="">(Tự động hiệu chỉnh online khi không chọn thẻ)</option>
+          </select>
+        </div>
+        <div>
+          <label for="launch-quality-tolerance">Ngưỡng giữ chất lượng ε (epsilon_constraint)</label>
+          <input id="launch-quality-tolerance" type="number" min="0" max="0.5" step="0.005" value="0.03" />
+        </div>
+        <div>
+          <label for="launch-max-memory">Trần VRAM / Bộ nhớ tối đa (MiB)</label>
+          <input id="launch-max-memory" type="number" min="128" step="64" placeholder="Tự động (80% VRAM trống)" />
         </div>
       </div>
     </div>
