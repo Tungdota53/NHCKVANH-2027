@@ -1070,9 +1070,13 @@ def _svg_benchmark_bars(summaries, lang="vi"):
     row_h = plot_h / max(1, len(summaries))
     lines.append(f'<rect x="{pad_l}" y="{pad_t}" width="{plot_w}" height="{plot_h}" fill="none" stroke="#d1d5db" stroke-width="1"/>')
     color_map = {
+        "conformal_mf": OKABE_ITO[2],
         "adaptive_full": OKABE_ITO[0],
         "adaptive_ehvi": OKABE_ITO[1],
-        "adaptive_staged_seeds": OKABE_ITO[2],
+        "adaptive_staged_seeds": OKABE_ITO[5],
+        "constrained_bo": OKABE_ITO[4],
+        "mf_no_conformal": OKABE_ITO[3],
+        "tpe_bo": "#334155",
     }
     for idx, row in enumerate(summaries):
         y = pad_t + idx * row_h + row_h * 0.2
@@ -1912,8 +1916,8 @@ def _export_benchmark_or_algorithm_study(folder, out_dir, lang="vi"):
             if has_vram_safety_global:
                 s_row += [v_viol, v_waste, c_prun]
             summary_rows.append(s_row)
-            if len(svg_bars) < 12:
-                svg_bars.append({"method": s["method"], "regret": reg_m, "verified": verified_str, "t_mean": t_mean, "auarc_mean": auarc_m})
+            if len(svg_bars) < 28:
+                svg_bars.append({"method": f"{sid[:4]}:{s['method']}" if len(studies) > 1 else s["method"], "regret": reg_m, "verified": verified_str, "t_mean": t_mean, "auarc_mean": auarc_m})
             opt_s = "—" if opt_hit is None else f"{opt_hit:.1%}"
             par_s = "—" if par_hit is None else f"{par_hit:.1%}"
             opt_tex = "---" if opt_hit is None else _tex_escape(f"{opt_hit:.1%}")
@@ -2094,6 +2098,72 @@ def export_conformal_vram_svg(measurements, card, out_path, *, vram_free_mb=None
 
     parts.append(f'<text x="{pad_l + pw/2:.1f}" y="{H - 18}" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1e293b">{html.escape(xlab)}</text>')
     parts.append(f'<text x="18" y="{pad_t + ph/2:.1f}" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1e293b" transform="rotate(-90 18 {pad_t + ph/2:.1f})">{html.escape(ylab)}</text>')
+    parts.append("</svg>")
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(parts) + "\n", encoding="utf-8")
+    return out
+
+
+def export_selection_rule_ablation_svg(ablation_rows, out_path, lang="vi"):
+    """Render Okabe-Ito vector trade-off plot of Selection Rules (Weighted/Tchebycheff/TOPSIS/Knee/epsilon-constraint)."""
+    is_en = lang == "en"
+    W, H = 760, 460
+    pad_l, pad_r, pad_t, pad_b = 76, 40, 52, 68
+    pw, ph = W - pad_l - pad_r, H - pad_t - pad_b
+    rows = [r for r in (ablation_rows or []) if isinstance(r.get("quality_mean"), (int, float)) and isinstance(r.get("time_mean"), (int, float))]
+    if not rows:
+        raise ValueError("No valid rows to plot pareto_epsilon_tradeoff.svg")
+
+    ts = [float(r["time_mean"]) for r in rows]
+    qs = [float(r["quality_mean"]) for r in rows]
+    t0, t1 = max(0.0, min(ts) * 0.85), max(ts) * 1.12
+    q0 = max(0.0, min(qs) - 0.03)
+    q1 = min(1.02, max(qs) + 0.03)
+    t_span = max(1e-6, t1 - t0)
+    q_span = max(1e-6, q1 - q0)
+
+    def sx(t):
+        return pad_l + ((t - t0) / t_span) * pw
+
+    def sy(q):
+        return pad_t + ph - ((q - q0) / q_span) * ph
+
+    title = "Selection-Rule Sensitivity: Quality Retention vs Worker Time" if is_en else "Độ nhạy Quy tắc Chọn lọc: Bảo toàn Chất lượng vs Thời gian"
+    xlab = "Mean Worker Wall Time (s, lower is faster)" if is_en else "Thời gian trung bình mỗi lượt Full (giây, thấp hơn là nhanh hơn)"
+    ylab = "Validation Quality Mean (higher is better)" if is_en else "Chất lượng Validation trung bình (cao hơn là tốt hơn)"
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img">',
+        f'<rect width="{W}" height="{H}" fill="#ffffff"/>',
+        f'<text x="{W / 2:.1f}" y="28" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="bold" fill="#111827">{html.escape(title)}</text>',
+        f'<rect x="{pad_l}" y="{pad_t}" width="{pw}" height="{ph}" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1"/>',
+    ]
+    for k in range(5):
+        frac = k / 4.0
+        gy = pad_t + ph * (1.0 - frac)
+        qv = q0 + frac * q_span
+        gx = pad_l + pw * frac
+        tv = t0 + frac * t_span
+        parts.append(f'<line x1="{pad_l}" y1="{gy:.1f}" x2="{pad_l + pw}" y2="{gy:.1f}" stroke="#e2e8f0"/>')
+        parts.append(f'<text x="{pad_l - 8}" y="{gy + 4:.1f}" text-anchor="end" font-family="sans-serif" font-size="10" fill="#475569">{qv:.3f}</text>')
+        parts.append(f'<text x="{gx:.1f}" y="{pad_t + ph + 16}" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#475569">{tv:.1f}s</text>')
+
+    domains = sorted({str(r.get("domain", "study")) for r in rows})
+    for d_idx, dom in enumerate(domains):
+        d_rows = sorted((r for r in rows if str(r.get("domain", "study")) == dom), key=lambda x: (float(x["time_mean"]), float(x["quality_mean"])))
+        col = OKABE_ITO[d_idx % len(OKABE_ITO)]
+        if len(d_rows) >= 2:
+            poly = " ".join(f"{sx(float(r['time_mean'])):.1f},{sy(float(r['quality_mean'])):.1f}" for r in d_rows)
+            parts.append(f'<polyline points="{poly}" fill="none" stroke="{col}" stroke-width="1.8" stroke-dasharray="4,3"/>')
+        for r in d_rows:
+            cx, cy = sx(float(r["time_mean"])), sy(float(r["quality_mean"]))
+            lbl = str(r.get("label", r.get("rule", "")))
+            parts.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="5.2" fill="{col}" stroke="#ffffff" stroke-width="1.2"><title>{html.escape(dom)} · {html.escape(lbl)}: Q={r["quality_mean"]:.4f}, T={r["time_mean"]:.1f}s</title></circle>')
+            parts.append(f'<text x="{cx + 7:.1f}" y="{cy - 5:.1f}" font-family="sans-serif" font-size="9.5" fill="#0f172a">{html.escape(lbl)}</text>')
+
+    parts.append(f'<text x="{pad_l + pw / 2:.1f}" y="{H - 18}" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1e293b">{html.escape(xlab)}</text>')
+    parts.append(f'<text x="18" y="{pad_t + ph / 2:.1f}" text-anchor="middle" transform="rotate(-90 18 {pad_t + ph / 2:.1f})" font-family="sans-serif" font-size="11" fill="#1e293b">{html.escape(ylab)}</text>')
     parts.append("</svg>")
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)

@@ -299,79 +299,112 @@ class ConformalVRAMAndMethodTests(unittest.TestCase):
         self.assertEqual(locked["selection_rule"], "epsilon_constraint")
         self.assertAlmostEqual(locked["quality_tolerance"], 0.025)
 
-    def test_risk_gated_conformal_mf_handoff_to_tpe_and_webui_resources(self):
+    def test_cc_mfbo_unified_feasibility_residual_gp_and_constrained_bo(self):
         from unittest.mock import patch
+        from research_pipeline.v2.conformal_vram import conformal_feasibility_probability
         from research_pipeline.v2.web_ui.data_access import launch_job_action, list_workspace_resources
 
-        # Verify risk-gated handoff triggers on unconstrained memory when no card is loaded
-        cfgs = [
-            {"model": "cnn_classifier", "imgsz": 32, "batch": 16, "accumulation": 1, "precision": "fp32", "optimizer": "AdamW", "lr0": 0.001, "weight_decay": 0.01, "width": 16},
-            {"model": "cnn_classifier", "imgsz": 32, "batch": 16, "accumulation": 1, "precision": "fp32", "optimizer": "AdamW", "lr0": 0.0003, "weight_decay": 0.01, "width": 32},
-            {"model": "cnn_classifier", "imgsz": 32, "batch": 16, "accumulation": 1, "precision": "fp32", "optimizer": "AdamW", "lr0": 0.003, "weight_decay": 0.01, "width": 64},
-            {"model": "cnn_classifier", "imgsz": 48, "batch": 16, "accumulation": 1, "precision": "fp32", "optimizer": "AdamW", "lr0": 0.001, "weight_decay": 0.01, "width": 16},
-        ]
-        descriptors = {"cnn_classifier": {"model_identity": "cnn_classifier", "parameters": 50_000, "layers": 6, "gflops_reference_32": 0.01, "trainable_parameters": 50_000}}
-        prot = lock_protocol({
-            "implementation_version": "1.0.0",
-            "mode": "online",
-            "method": "conformal_mf",
-            "selection_rule": "epsilon_constraint",
-            "quality_tolerance": 0.03,
-            "conformal_vram_card": None,
-            "model_descriptors": descriptors,
-            "dataset_descriptor": {"class_entropy": 2.0},
-            "run_directory": "tmp",
-            "task": "classification",
-            "quality_definition": "final epoch validation accuracy",
-            "dataset_source": "synthetic",
-            "dataset_sha256": "a" * 64,
-            "dataset_content_id": "b" * 64,
-            "subset_sha256": "c" * 64,
-            "hardware": {"device": "cpu", "ram_available_mb": 8000.0},
-            "runtime_versions": {"python": "3.12"},
-            "configs": cfgs,
-            "training_seeds": [17],
-            "split_seed": 101,
-            "search_seed": 17,
-            "full_epochs": 5,
-            "probe_epochs": 1,
-            "trial_timeout": 100.0,
-            "budget_seconds": 30.0,
-            "objective": {"name": "balanced", "min_quality": 0.0, "max_time": None, "max_memory": 4000.0, "time_scale": 100.0, "memory_scale": 1024.0, "weights": [0.6, 0.25, 0.15]},
-            "example_counts": {"train": 200, "val": 50, "test": 50},
-            "num_classes": 10,
-            "scheduler": {"policy_version": 3, "probe_fraction": 0.42, "cost_margin": 1.25, "cleanup_seconds": 1.0},
-            "acquisition": {"version": 2, "kernel_ridge": 0.05, "length_scale": 1.0, "exploration": 0.25, "novelty_weight": 0.05},
-            "source_files": {},
-            "model_files": {},
-            "data_files": {},
-        })
-        clock = [0.0]
-        with tempfile.TemporaryDirectory() as td:
-            ledger = Ledger(Path(td) / "events.jsonl")
-            def eval_cpu(idx, seed, epochs, full, avail):
-                dt = 3.0 if full else 1.5
-                clock[0] += dt
-                return {
-                    "status": "ok",
-                    "epochs_completed": epochs,
-                    "worker_wall_seconds": dt,
-                    "measured_loop_seconds": dt * 0.8,
-                    "memory_mb": 420.0 + idx * 10.0,  # << 0.50 * 4000 MiB
-                    "optimizer_steps": epochs * 10,
-                    "training_loss_finite": True,
-                    "actual_config_verified": True,
-                    "checkpoint_sha256": "e" * 64,
-                    "quality": 0.20 + 0.04 * idx if full else 0.08,
-                }
-            st = run_search(prot, eval_cpu, lambda: max(0.0, 30.0 - clock[0]), ledger)
-            # Only 2 probes needed before risk_gated_tpe_handoff triggers cleanly
-            self.assertEqual(len(st["probes"]), 2)
-            self.assertIsNotNone(st["decision"]["selected_config_id"])
-            ev_text = (Path(td) / "events.jsonl").read_text(encoding="utf-8")
-            self.assertIn("risk_gated_tpe_handoff", ev_text)
+        self.assertIn("constrained_bo", METHODS)
 
-        # Verify Web UI resources and CLI builder support breakthrough flags
+        # 1. Verify unified Conformal feasibility probability (borderline + OOM + unconstrained)
+        fit_recs = [_make_record(b, s, params=2_600_000, flops=0.01653) for s in (320, 480) for b in (2, 4, 8)]
+        cal_recs = [_make_record(b, s, params=2_600_000, flops=0.01653) for s in (320, 480, 640) for b in (2, 4, 8)]
+        card = fit_conformal_vram_card(fit_recs, cal_recs, alphas=(0.10, 0.05), task="detection")
+
+        p_safe = conformal_feasibility_probability(card, fit_recs[0]["config"], 1800.0, fit_recs[0]["descriptor"], task="detection")
+        oom_rec = _make_record(16, 800, params=2_600_000, flops=0.01653, precision="fp32")
+        p_oom = conformal_feasibility_probability(card, oom_rec["config"], 1800.0, oom_rec["descriptor"], task="detection")
+        p_unconstrained = conformal_feasibility_probability(None, fit_recs[0]["config"], None, fit_recs[0]["descriptor"], task="classification")
+        self.assertGreaterEqual(p_safe, 0.90)
+        self.assertLess(p_oom, 0.15)
+        self.assertEqual(p_unconstrained, 1.0)
+
+        # 2. Verify CC-MFBO escapes Zone A small-first trap, diversifies across search_seeds, and constrained_bo runs cleanly
+        cfgs = [
+            {"model": "m_s.pt", "imgsz": 320, "batch": 4, "accumulation": 1, "precision": "fp16", "optimizer": "AdamW", "lr0": 0.001, "weight_decay": 0.0005, "freeze": 5},   # c00 Zone A
+            {"model": "m_l.pt", "imgsz": 640, "batch": 16, "accumulation": 1, "precision": "fp32", "optimizer": "AdamW", "lr0": 0.001, "weight_decay": 0.0005, "freeze": 0},  # c01 Zone C OOM
+            {"model": "m_s.pt", "imgsz": 320, "batch": 8, "accumulation": 1, "precision": "fp16", "optimizer": "AdamW", "lr0": 0.001, "weight_decay": 0.0005, "freeze": 5},   # c02 Zone A
+            {"model": "m_s.pt", "imgsz": 320, "batch": 12, "accumulation": 1, "precision": "fp16", "optimizer": "AdamW", "lr0": 0.001, "weight_decay": 0.0005, "freeze": 5},  # c03 Zone A
+            {"model": "m_l.pt", "imgsz": 480, "batch": 4, "accumulation": 1, "precision": "fp16", "optimizer": "AdamW", "lr0": 0.001, "weight_decay": 0.0005, "freeze": 0},   # c04 Zone B OPT (pt~1556)!
+            {"model": "m_l.pt", "imgsz": 480, "batch": 2, "accumulation": 1, "precision": "fp16", "optimizer": "AdamW", "lr0": 0.001, "weight_decay": 0.0005, "freeze": 0},   # c05 Zone B
+        ]
+        descriptors = {
+            "m_s.pt": {"model_identity": "m_s.pt", "parameters": 2_600_000, "layers": 24, "gflops_reference_32": 0.01653, "trainable_parameters": 1_800_000},
+            "m_l.pt": {"model_identity": "m_l.pt", "parameters": 5_000_000, "layers": 24, "gflops_reference_32": 0.03200, "trainable_parameters": 5_000_000},
+        }
+        q_true = {0: 0.50, 1: 0.88, 2: 0.52, 3: 0.51, 4: 0.87, 5: 0.72}
+        mem_true = {0: 320.0, 1: 4200.0, 2: 450.0, 3: 560.0, 4: 1320.0, 5: 850.0}
+        t_true = {0: 6.0, 1: 12.0, 2: 6.2, 3: 6.5, 4: 8.5, 5: 7.5}
+
+        def run_det(method, sseed):
+            prot = lock_protocol({
+                "implementation_version": "1.0.0",
+                "mode": "online",
+                "method": method,
+                "selection_rule": "epsilon_constraint",
+                "quality_tolerance": 0.03,
+                "conformal_vram_card": card if method == "conformal_mf" else None,
+                "model_descriptors": descriptors,
+                "dataset_descriptor": {"class_entropy": 1.0},
+                "run_directory": "tmp",
+                "task": "detection",
+                "detection_metric": "map50",
+                "quality_definition": "best validation mAP50 within declared horizon",
+                "dataset_source": "synthetic",
+                "dataset_sha256": "a" * 64,
+                "dataset_content_id": "b" * 64,
+                "subset_sha256": "c" * 64,
+                "hardware": {"device": "0", "gpu": "MockGPU", "vram_free_mb": 1850.0},
+                "runtime_versions": {"python": "3.12"},
+                "configs": cfgs,
+                "training_seeds": [17],
+                "split_seed": 101,
+                "search_seed": sseed,
+                "full_epochs": 4,
+                "probe_epochs": 1,
+                "trial_timeout": 100.0,
+                "budget_seconds": 25.0,
+                "objective": {"name": "balanced", "min_quality": 0.0, "max_time": None, "max_memory": 1850.0, "time_scale": 50.0, "memory_scale": 1024.0, "weights": [0.6, 0.25, 0.15]},
+                "example_counts": {"train": 160, "val": 40, "test": 40},
+                "num_classes": 4,
+                "scheduler": {"policy_version": 3, "probe_fraction": 0.28, "cost_margin": 1.25, "cleanup_seconds": 1.0},
+                "acquisition": {"version": 2, "kernel_ridge": 0.05, "length_scale": 1.0, "exploration": 0.25, "novelty_weight": 0.05},
+                "source_files": {},
+                "model_files": {},
+                "data_files": {},
+            })
+            clock = [0.0]
+            with tempfile.TemporaryDirectory() as td:
+                ledger = Ledger(Path(td) / "events.jsonl")
+                def ev_fn(idx, seed, epochs, full, avail):
+                    dt = t_true[idx] * (0.25 if not full else 1.0)
+                    clock[0] += dt
+                    if idx == 1:
+                        return {"status": "oom", "epochs_completed": 0, "worker_wall_seconds": dt, "memory_mb": mem_true[idx], "optimizer_steps": 0, "training_loss_finite": False, "actual_config_verified": False, "checkpoint_sha256": None, "quality": None}
+                    return {"status": "ok", "epochs_completed": epochs, "worker_wall_seconds": dt, "measured_loop_seconds": dt * 0.8, "memory_mb": mem_true[idx], "optimizer_steps": epochs * 10, "training_loss_finite": True, "actual_config_verified": True, "checkpoint_sha256": "e" * 64, "quality": q_true[idx] - (0.10 if not full else 0.0)}
+                st = run_search(prot, ev_fn, lambda: max(0.0, 25.0 - clock[0]), ledger)
+                ev_txt = (Path(td) / "events.jsonl").read_text(encoding="utf-8")
+                return st, ev_txt
+
+        st_17, ev_17 = run_det("conformal_mf", 17)
+        st_29, _ = run_det("conformal_mf", 29)
+        st_af, _ = run_det("adaptive_full", 17)
+        st_cbo, ev_cbo = run_det("constrained_bo", 17)
+
+        # CC-MFBO never triggers legacy handoff and jumps via Stage 1 probes directly to Zone B c04
+        self.assertNotIn("risk_gated_tpe_handoff", ev_17)
+        self.assertIn("cc_mfbo_unified", ev_17)
+        self.assertEqual(st_17["decision"]["selected_index"], 4)
+        self.assertEqual(st_29["decision"]["selected_index"], 4)
+        # Seed stratification picks distinct initial fast-tier probes across search seeds when Pool >= 2
+        self.assertNotEqual(st_17["probes"][0]["index"], st_29["probes"][0]["index"])
+        # adaptive_full wastes budget confirming Zone A (0, 2, 3) and misses c04 under 25s budget!
+        self.assertNotEqual(st_af["decision"]["selected_index"], 4)
+        # constrained_bo records cEI ledger events cleanly
+        self.assertIn("constrained_bo_step", ev_cbo)
+        self.assertIsNotNone(st_cbo["decision"]["selected_config_id"])
+
+        # 3. Verify Web UI resources and CLI builder support breakthrough flags
         res = list_workspace_resources()
         self.assertIn("conformal_cards", res)
         self.assertTrue(any(c["name"] == "conformal_vram_card_rtx3050.json" for c in res["conformal_cards"]))
@@ -389,7 +422,7 @@ class ConformalVRAMAndMethodTests(unittest.TestCase):
                     "method": "conformal_mf",
                     "selection_rule": "epsilon_constraint",
                     "quality_tolerance": 0.03,
-                    "max_memory": 1800,
+                    "max_memory": 1850,
                     "conformal_vram_card": "configs/conformal_vram_card_rtx3050.json",
                     "output": "ui_test_out",
                 })

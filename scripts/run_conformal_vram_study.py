@@ -20,6 +20,7 @@ from yolo_tuner.adapters import export_yolo, subset
 from yolo_tuner.pipeline import write_json
 from yolo_tuner.research import digest
 from research_pipeline.v2.conformal_vram import (
+    _activation_proxy,
     calibrate_online_2point,
     evaluate_conformal_vram,
     fit_conformal_vram_card,
@@ -31,38 +32,70 @@ from research_pipeline.v2.model_features import architecture_key, describe_model
 
 
 def build_probe_configs():
-    """Return 28 realistic YOLO configs spanning 3 models, imgsz, batch, precision, freeze, optimizer."""
+    """Return 60 realistic YOLO configs across 3 models (dense 900-2500 MiB boundary + WDDM spill probes)."""
     specs = [
-        # --- weights/yolo11n.pt (10 configs, safe -> high-VRAM -> OOM probe) ---
-        ("weights/yolo11n.pt", 320, 2, "fp16", 0, "AdamW"),
+        # --- weights/yolo11n.pt (20 configs) ---
+        ("weights/yolo11n.pt", 320, 2, "fp16", 5, "AdamW"),
         ("weights/yolo11n.pt", 320, 4, "fp16", 5, "AdamW"),
         ("weights/yolo11n.pt", 320, 8, "fp16", 0, "SGD"),
+        ("weights/yolo11n.pt", 320, 12, "fp16", 0, "AdamW"),
         ("weights/yolo11n.pt", 320, 16, "fp16", 0, "AdamW"),
+        ("weights/yolo11n.pt", 416, 4, "fp16", 0, "AdamW"),
+        ("weights/yolo11n.pt", 416, 8, "fp16", 0, "SGD"),
         ("weights/yolo11n.pt", 480, 4, "fp16", 0, "AdamW"),
-        ("weights/yolo11n.pt", 480, 8, "fp32", 0, "AdamW"),
-        ("weights/yolo11n.pt", 640, 4, "fp16", 0, "AdamW"),
+        ("weights/yolo11n.pt", 480, 8, "fp16", 0, "AdamW"),
+        ("weights/yolo11n.pt", 480, 4, "fp32", 0, "AdamW"),
+        ("weights/yolo11n.pt", 480, 8, "fp32", 0, "SGD"),
+        ("weights/yolo11n.pt", 576, 4, "fp16", 0, "AdamW"),
+        ("weights/yolo11n.pt", 576, 8, "fp16", 5, "AdamW"),
+        ("weights/yolo11n.pt", 640, 2, "fp16", 5, "AdamW"),
+        ("weights/yolo11n.pt", 640, 4, "fp16", 0, "SGD"),
+        ("weights/yolo11n.pt", 640, 8, "fp16", 0, "AdamW"),
+        ("weights/yolo11n.pt", 640, 4, "fp32", 0, "AdamW"),
         ("weights/yolo11n.pt", 640, 8, "fp32", 0, "SGD"),
         ("weights/yolo11n.pt", 640, 16, "fp32", 0, "AdamW"),
-        ("weights/yolo11n.pt", 800, 16, "fp32", 0, "AdamW"),
-        # --- weights/yolo11s.pt (10 configs, medium -> high-VRAM -> real OOM probes) ---
+        ("weights/yolo11n.pt", 800, 12, "fp32", 0, "AdamW"),
+        # --- weights/yolo11s.pt (20 configs) ---
         ("weights/yolo11s.pt", 320, 2, "fp16", 5, "AdamW"),
         ("weights/yolo11s.pt", 320, 4, "fp16", 0, "AdamW"),
+        ("weights/yolo11s.pt", 320, 8, "fp16", 0, "SGD"),
         ("weights/yolo11s.pt", 320, 8, "fp32", 0, "SGD"),
+        ("weights/yolo11s.pt", 416, 4, "fp16", 3, "AdamW"),
+        ("weights/yolo11s.pt", 416, 8, "fp16", 0, "AdamW"),
+        ("weights/yolo11s.pt", 480, 2, "fp16", 5, "AdamW"),
         ("weights/yolo11s.pt", 480, 4, "fp16", 0, "AdamW"),
+        ("weights/yolo11s.pt", 480, 6, "fp16", 0, "SGD"),
         ("weights/yolo11s.pt", 480, 8, "fp16", 0, "AdamW"),
+        ("weights/yolo11s.pt", 480, 4, "fp32", 0, "AdamW"),
+        ("weights/yolo11s.pt", 576, 4, "fp16", 0, "SGD"),
+        ("weights/yolo11s.pt", 576, 6, "fp16", 3, "AdamW"),
         ("weights/yolo11s.pt", 640, 2, "fp16", 5, "AdamW"),
+        ("weights/yolo11s.pt", 640, 4, "fp16", 0, "SGD"),
+        ("weights/yolo11s.pt", 640, 8, "fp16", 0, "AdamW"),
         ("weights/yolo11s.pt", 640, 4, "fp32", 0, "AdamW"),
-        ("weights/yolo11s.pt", 640, 8, "fp32", 0, "AdamW"),
-        ("weights/yolo11s.pt", 640, 16, "fp32", 0, "AdamW"),
-        ("weights/yolo11s.pt", 800, 16, "fp32", 0, "AdamW"),
-        # --- weights/yolo26n.pt (8 configs, distinct architecture LOMO transfer test) ---
+        ("weights/yolo11s.pt", 640, 8, "fp32", 0, "SGD"),
+        ("weights/yolo11s.pt", 640, 12, "fp32", 0, "AdamW"),
+        ("weights/yolo11s.pt", 800, 8, "fp32", 0, "AdamW"),
+        # --- weights/yolo26n.pt (20 configs) ---
         ("weights/yolo26n.pt", 320, 2, "fp16", 5, "AdamW"),
         ("weights/yolo26n.pt", 320, 4, "fp16", 0, "AdamW"),
+        ("weights/yolo26n.pt", 320, 8, "fp16", 0, "SGD"),
         ("weights/yolo26n.pt", 320, 8, "fp32", 0, "AdamW"),
+        ("weights/yolo26n.pt", 416, 4, "fp16", 2, "AdamW"),
+        ("weights/yolo26n.pt", 416, 8, "fp16", 0, "SGD"),
+        ("weights/yolo26n.pt", 480, 2, "fp16", 5, "AdamW"),
         ("weights/yolo26n.pt", 480, 4, "fp16", 0, "SGD"),
         ("weights/yolo26n.pt", 480, 8, "fp16", 0, "AdamW"),
+        ("weights/yolo26n.pt", 480, 4, "fp32", 0, "AdamW"),
+        ("weights/yolo26n.pt", 576, 4, "fp16", 0, "AdamW"),
+        ("weights/yolo26n.pt", 576, 8, "fp16", 2, "SGD"),
+        ("weights/yolo26n.pt", 640, 2, "fp16", 5, "AdamW"),
         ("weights/yolo26n.pt", 640, 4, "fp16", 0, "AdamW"),
+        ("weights/yolo26n.pt", 640, 8, "fp16", 0, "SGD"),
+        ("weights/yolo26n.pt", 640, 4, "fp32", 0, "SGD"),
         ("weights/yolo26n.pt", 640, 8, "fp32", 0, "AdamW"),
+        ("weights/yolo26n.pt", 640, 12, "fp32", 0, "AdamW"),
+        ("weights/yolo26n.pt", 800, 4, "fp16", 0, "AdamW"),
         ("weights/yolo26n.pt", 800, 8, "fp32", 0, "AdamW"),
     ]
     out = []
@@ -148,17 +181,22 @@ def _lomo_evaluation(ok_records, descriptors, alphas=(0.10, 0.05)):
         by_model.setdefault(rec["config"]["model"], []).append(rec)
     lomo = {}
     for held_model, target_recs in sorted(by_model.items()):
-        source_recs = [r for m, rs in sorted(by_model.items()) if m != held_model for r in rs]
-        rng = random.Random(2027)
-        shuffled = list(source_recs)
-        rng.shuffle(shuffled)
-        mid = len(shuffled) // 2
-        card = fit_conformal_vram_card(shuffled[:mid], shuffled[mid:], alphas=alphas, ridge=1.0, task="detection")
+        src_fit, src_cal = [], []
+        for m_name, rs in sorted(by_model.items()):
+            if m_name == held_model:
+                continue
+            rs_s = sorted(rs, key=lambda x: float(x["memory_mb"]))
+            for k_idx, rec in enumerate(rs_s):
+                (src_cal if k_idx % 2 == 1 else src_fit).append(rec)
+        source_recs = src_fit + src_cal
+        card = fit_conformal_vram_card(src_fit, src_cal, alphas=alphas, ridge="auto", task="detection")
 
-        ordered_target = sorted(target_recs, key=lambda r: (r["memory_mb"], r["config"]["imgsz"], r["config"]["batch"]))
+        ordered_target = sorted(target_recs, key=lambda r: _activation_proxy(r["config"], r.get("descriptor"), task="detection"))
+        safe = [r for r in ordered_target if float(r["memory_mb"]) <= 2400.0]
+        pool = safe if len(safe) >= 3 else ordered_target
         anchors = (
-            [ordered_target[0], ordered_target[min(len(ordered_target) - 1, max(1, len(ordered_target) // 3))]]
-            if len(ordered_target) >= 3 else ordered_target[:2]
+            [pool[0], pool[min(len(pool) - 1, max(1, (2 * len(pool)) // 3))]]
+            if len(pool) >= 2 else ordered_target[:2]
         )
         eval_pts = [r for r in ordered_target if r not in anchors] or ordered_target
         cal_2pt = calibrate_online_2point(card, anchors, task="detection") if len(anchors) >= 1 else None
@@ -244,8 +282,8 @@ def main():
         if m["status"] == "oom" or (isinstance(m.get("memory_mb"), (int, float)) and float(m["memory_mb"]) > vram_free_mb)
     ]
 
-    # Repeated 50x Split Conformal Evaluation on observed ok_records (plus edge-GPU ceiling 1800 MiB & WDDM spill ceiling)
-    eval_split = evaluate_conformal_vram(ok_records, alphas=(0.10, 0.05), n_splits=50, seed=2027, task="detection", limit_mb=1800.0)
+    # Repeated 50x Split Conformal Evaluation on observed ok_records (plus edge-GPU ceiling 1850 MiB & WDDM spill ceiling)
+    eval_split = evaluate_conformal_vram(ok_records, alphas=(0.10, 0.05), n_splits=50, seed=2027, task="detection", limit_mb=1850.0)
     eval_spill = evaluate_conformal_vram(ok_records, alphas=(0.10, 0.05), n_splits=50, seed=2027, task="detection", limit_mb=vram_free_mb)
 
     # Export canonical card using deterministic stratified split across models (fit 50% / cal 50%)
@@ -261,7 +299,7 @@ def main():
         fit_recs,
         cal_recs,
         alphas=(0.10, 0.05),
-        ridge=1.0,
+        ridge="auto",
         task="detection",
         metadata={"gpu": gpu_name, "vram_total_mb": vram_total_mb, "dataset": "african_wildlife_benchmark", "n_probes": len(ok_records)},
     )
@@ -288,6 +326,8 @@ def main():
 
     q05 = card["quantiles"]["0.05"]["q_add_mb"]
     q10 = card["quantiles"]["0.1"]["q_add_mb"]
+    qn05 = card["quantiles"]["0.05"].get("q_norm", 0.0)
+    qn10 = card["quantiles"]["0.1"].get("q_norm", 0.0)
 
     summary = {
         "gpu": gpu_name,
@@ -299,8 +339,8 @@ def main():
         "other_error_count": sum(1 for m in measurements if m["status"] not in {"ok", "oom"}),
         "conformal_card_path": str(card_path),
         "conformal_card_sha256": card["sha256"],
-        "quantiles_summary": {"q_add_0.05_mb": q05, "q_add_0.1_mb": q10},
-        "repeated_split_eval_1800": eval_split,
+        "quantiles_summary": {"q_norm_0.05": qn05, "q_norm_0.1": qn10, "q_add_0.05_mb": q05, "q_add_0.1_mb": q10},
+        "repeated_split_eval_1850": eval_split,
         "repeated_split_eval_vram_free": eval_spill,
         "lomo_transfer": lomo,
         "vram_spill_and_oom_screening": oom_check,
@@ -313,7 +353,7 @@ def main():
         "",
         f"- GPU: `{gpu_name}` (`{vram_free_mb:.1f}` MiB free / `{vram_total_mb:.1f}` MiB total)",
         f"- Probes completed: `{len(ok_records)}/{len(measurements)}` OK, `{len(oom_or_spill_records)}` spilled past physical free VRAM (`>{vram_free_mb:.0f} MiB`) into WDDM shared memory",
-        f"- Exported Card: `{card_path.relative_to(REPO_ROOT)}` (fit={len(fit_recs)}, cal={len(cal_recs)}, q_add@95={q05:.1f} MiB, q_add@90={q10:.1f} MiB)",
+        f"- Exported Card: `{card_path.relative_to(REPO_ROOT)}` (fit={len(fit_recs)}, cal={len(cal_recs)}, q_norm@95={qn05:.3f}, q_norm@90={qn10:.3f}, q_add@95={q05:.1f} MiB)",
         "",
         "## In-Distribution Split Conformal (50x stratified splits)",
         "",
@@ -324,7 +364,8 @@ def main():
             f"- alpha={a_str} (target {stats['target_coverage']:.0%}): empirical coverage = `{stats['empirical_coverage_mean']:.3f}` (±{stats['empirical_coverage_sd']:.3f}), "
             f"MAE = `{stats['mae_mb_mean']:.1f}` MiB, RMSE = `{stats['rmse_mb_mean']:.1f}` MiB, "
             f"mean conformal margin = `{stats['mean_interval_width_mb']:.1f}` MiB, "
-            f"pruning recall@1800 = `{stats['oom_prevention_rate']}`, spill recall@{vram_free_mb:.0f} = `{sp_stats.get('oom_prevention_rate')}`"
+            f"false rejection@1850 = `{stats['false_rejection_rate']}`, "
+            f"pruning recall@1850 = `{stats['oom_prevention_rate']}`, spill recall@{vram_free_mb:.0f} = `{sp_stats.get('oom_prevention_rate')}`"
         )
     lines += ["", "## Leave-One-Model-Out (LOMO) Transfer", "", "| Held-out Model | Mode | Unseen n | MAE (MiB) | Cov@90 | Cov@95 | Mean Margin@95 |", "|---|---|---:|---:|---:|---:|---:|"]
     for m_name, lstats in lomo.items():
@@ -341,7 +382,7 @@ def main():
             lines.append(f"| #{oc['index']} | {Path(c['model']).name} | {c['imgsz']}/{c['batch']}/{c['precision']} | {oc['observed_memory_mb']:.1f} | {oc['wall_seconds']:.2f} | {oc['predicted_point_mb']:.1f} | {oc['upper_bound_95_mb']:.1f} | {oc['exceeds_vram_free']} |")
     (out_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     from research_pipeline.v2.paper_export import export_conformal_vram_svg
-    svg_path = export_conformal_vram_svg(measurements, card, out_dir / "conformal_vram_calibration.svg", vram_free_mb=vram_free_mb, edge_limit_mb=1800.0, lang="vi")
+    svg_path = export_conformal_vram_svg(measurements, card, out_dir / "conformal_vram_calibration.svg", vram_free_mb=vram_free_mb, edge_limit_mb=1850.0, lang="vi")
     print(f"\n[Phase 2 DONE] Summary written to {out_dir / 'summary.md'} | Plot: {svg_path}", flush=True)
 
 

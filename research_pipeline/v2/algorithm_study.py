@@ -21,7 +21,7 @@ from . import benchmark
 
 
 BASELINES = ("random", "reserve", "default", "successive_halving")
-PAIRWISE_BASELINES = BASELINES + ("tpe_bo", "mf_no_conformal")
+PAIRWISE_BASELINES = BASELINES + ("tpe_bo", "mf_no_conformal", "constrained_bo")
 MIN_BOOTSTRAP_REPEATS = 5
 
 
@@ -184,15 +184,16 @@ def _holm_bonferroni(p_values):
     return adjusted
 
 
-def _paired(outcomes, settings):
+def _paired(outcomes, settings, extra_baselines=()):
     by_method = defaultdict(dict)
     for row in outcomes:
         by_method[row["method"]][row["search_seed"]] = row
     comparisons = []
     metric_names = ("objective_regret", "online_seconds", "time_to_first_full_config_seconds", "feasible")
+    pairwise_pool = tuple(dict.fromkeys(PAIRWISE_BASELINES + tuple(extra_baselines or ())))
     for method in sorted(by_method):
         method_comparisons = []
-        for baseline in PAIRWISE_BASELINES:
+        for baseline in pairwise_pool:
             if method == baseline or baseline not in by_method:
                 continue
             left, right = by_method[method], by_method[baseline]
@@ -245,7 +246,7 @@ def _paired(outcomes, settings):
     return comparisons
 
 
-def _audit_study(folder, reference_path, required_methods, settings):
+def _audit_study(folder, reference_path, required_methods, settings, extra_baselines=()):
     folder = Path(folder).resolve()
     manifest = _read(folder / "benchmark_protocol.json")
     if manifest.get("sha256") != digest({key: value for key, value in manifest.items() if key != "sha256"}):
@@ -349,7 +350,7 @@ def _audit_study(folder, reference_path, required_methods, settings):
         if row["budget_seconds"] != budget:
             raise ValueError("Audited comparison budget mismatch")
     domain = {"dataset_content_id": ref_protocol["dataset_content_id"], "task": ref_protocol["task"], "hardware": hardware}
-    paired = _paired(outcomes, settings)
+    paired = _paired(outcomes, settings, extra_baselines=extra_baselines)
     study = {"study": str(folder), "study_id": digest(str(folder))[:16], "benchmark_sha256": manifest["sha256"],
              "domain": domain, "domain_id": digest(domain)[:16], "methods": methods, "missing_baselines": [method for method in BASELINES if method not in methods],
              "search_seeds": seeds, "training_seeds_not_independent_repeats": ref_protocol["training_seeds"],
@@ -466,6 +467,7 @@ def analyze_studies(manifest_path, output_directory=None):
     if not isinstance(required, list) or any(not isinstance(method, str) for method in required) or len(set(required)) != len(required):
         raise ValueError("required_methods must be a list of distinct method names")
     settings = {"seed": manifest.get("bootstrap_seed", 2027), "samples": manifest.get("bootstrap_samples", 2000), "confidence": manifest.get("confidence", 0.95)}
+    extra_baselines = tuple(manifest.get("extra_pairwise_baselines") or ())
     bootstrap_mean([], **settings)  # Validate settings before reading raw trials.
     studies, seen_studies, seen_runs = [], set(), set()
     for entry in entries:
@@ -478,7 +480,7 @@ def analyze_studies(manifest_path, output_directory=None):
         if path in seen_studies:
             raise ValueError("Duplicate benchmark study; cannot inflate repeat/domain counts")
         seen_studies.add(path)
-        study, runs = _audit_study(path, reference, required, settings)
+        study, runs = _audit_study(path, reference, required, settings, extra_baselines=extra_baselines)
         if seen_runs & runs:
             raise ValueError("Benchmark studies reuse underlying runs/reference; not separate experimental evidence")
         seen_runs.update(runs)

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "studies": [
+    {
+      "path": "../runs/nckh_2027_v2_study1_wildlife_n8/20261127_135507_018765"
+    },
+    {
+      "path": "../runs/nckh_2027_v2_study2_pennfudan_n8/20261127_162300_884470"
+    },
+    {
+      "path": "../runs/nckh_2027_v2_study3_cifar10_gpu_n8/20261127_180444_686975"
+    }
+  ],
+  "required_methods": [
+    "conformal_mf",
+    "adaptive_full",
+    "constrained_bo",
+    "mf_no_conformal",
+    "successive_halving",
+    "tpe_bo",
+    "random",
+    "default"
+  ],
+  "extra_pairwise_baselines": [
+    "adaptive_full"
+  ],
+  "bootstrap_seed": 2027,
+  "bootstrap_samples": 2000,
+  "confidence": 0.95
+}

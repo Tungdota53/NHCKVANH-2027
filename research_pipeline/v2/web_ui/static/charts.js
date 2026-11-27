@@ -318,14 +318,16 @@
     if (!el) return;
     const rows = Array.isArray(summaries) ? summaries : [];
     if (!rows.length) return emptyState(el, "Chưa có dữ liệu tổng hợp đối chứng.");
-    const w = 640, h = 300;
-    const pad = { top: 24, right: 24, bottom: 52, left: 60 };
+    const many = rows.length > 8;
+    const w = many ? Math.max(680, 96 + rows.length * 38) : 640;
+    const h = many ? 375 : 300;
+    const pad = { top: 24, right: 24, bottom: many ? 124 : 52, left: 60 };
     const finiteVals = rows.map((r) => (r ? r.conditional_regret_mean : null)).filter(finite);
     const yMax = Math.max(0.05, ...finiteVals) * 1.15;
     const { g, plotW, plotH, sy } = axisFrame(w, h, pad, 0, rows.length, 0, yMax, "Thuật toán", "TB Objective Regret (thấp hơn là tốt hơn)", { hideXTicks: true });
     let inner = g;
     const slot = plotW / rows.length;
-    const bw = Math.max(18, Math.min(54, slot * 0.5));
+    const bw = Math.max(10, Math.min(many ? 32 : 54, slot * 0.56));
     const baseY = pad.top + plotH;
     rows.forEach((r, i) => {
       const cx = pad.left + slot * (i + 0.5);
@@ -338,7 +340,12 @@
       } else {
         inner += `<g class="null-regret"><title>${esc(methodLabel)}: không có cấu hình khả thi xác nhận (regret=null)</title><line x1="${(cx - bw / 2).toFixed(1)}" y1="${baseY.toFixed(1)}" x2="${(cx + bw / 2).toFixed(1)}" y2="${baseY.toFixed(1)}" stroke="var(--text-muted)" stroke-width="2" stroke-dasharray="4,3"/><text x="${cx.toFixed(1)}" y="${(baseY - 8).toFixed(1)}" text-anchor="middle" font-size="11" font-weight="600" fill="var(--text-muted)">null</text></g>`;
       }
-      inner += `<text x="${cx.toFixed(1)}" y="${h - 24}" text-anchor="middle" font-size="11" fill="var(--text)">${esc(methodLabel)}</text>`;
+      if (many) {
+        const ly = baseY + 12;
+        inner += `<text x="${cx.toFixed(1)}" y="${ly.toFixed(1)}" text-anchor="end" transform="rotate(-38 ${cx.toFixed(1)} ${ly.toFixed(1)})" font-size="10" fill="var(--text)">${esc(methodLabel)}</text>`;
+      } else {
+        inner += `<text x="${cx.toFixed(1)}" y="${h - 24}" text-anchor="middle" font-size="11" fill="var(--text)">${esc(methodLabel)}</text>`;
+      }
     });
     el.innerHTML = svgWrap(w, h, inner);
   }

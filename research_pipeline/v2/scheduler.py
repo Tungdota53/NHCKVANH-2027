@@ -19,7 +19,7 @@ ADAPTIVE_METHODS = (
     "adaptive_no_uncertainty",
     "adaptive_no_diversity",
 )
-METHODS = (*ADAPTIVE_METHODS, "conformal_mf", "mf_no_conformal", "tpe_bo", "reserve", "random", "default", "profile_all", "random_proxy", "quality_sh", "utility_sh", "no_reserve", "successive_halving", "prior_full")
+METHODS = (*ADAPTIVE_METHODS, "conformal_mf", "mf_no_conformal", "constrained_bo", "tpe_bo", "reserve", "random", "default", "profile_all", "random_proxy", "quality_sh", "utility_sh", "no_reserve", "successive_halving", "prior_full")
 
 
 def diversified_order(configs, seed):
@@ -166,9 +166,10 @@ def run_search(protocol, evaluate, remaining, ledger, initial=None, on_change=No
             if any(r.get("status") in {"oom", "config_mismatch", "training_evidence_missing"} for r in rows):
                 return
             cap = None
-            if protected and (method in {"successive_halving", "conformal_mf", "mf_no_conformal"} or method in ADAPTIVE_METHODS):
+            if protected and (method in {"successive_halving", "conformal_mf", "mf_no_conformal", "constrained_bo"} or method in ADAPTIVE_METHODS):
                 forecast = cost_model.estimate(i)
-                if policy_version >= 3 and method != "mf_no_conformal":
+                has_conformal_card = (method == "conformal_mf" and protocol.get("conformal_vram_card") is not None)
+                if policy_version >= 3 and method not in {"mf_no_conformal", "constrained_bo"} and not has_conformal_card:
                     risk_level, limit_mb, meas_mb = _memory_risk(forecast, objective, protocol, rows)
                     if risk_level in {"hard_exceeds_max_memory", "hard_exceeds_vram_free", "observed_seed_exceeded_max_memory", "observed_seed_exceeded_vram_free"}:
                         reason = ("observed seed memory exceeds effective memory limit; OOM/constraint risk guard"
@@ -179,15 +180,24 @@ def run_search(protocol, evaluate, remaining, ledger, initial=None, on_change=No
                         return
                 plan = forecast["planning_seconds"]
                 need = len(missing(i))
-                if plan is not None and plan * need + cleanup > remaining():
-                    ledger.emit("candidate_unresolved", index=i, reason="all-seed finalizer forecast exceeds remaining budget", forecast=forecast)
-                    return
-                if plan is None:
-                    # With no evidence no policy can promise affordability.
-                    # Share the unknown bootstrap budget across required seeds
-                    # instead of letting one unknown worker consume it all.
-                    cap = max(0, (remaining() - cleanup) / need)
-                    ledger.emit("candidate_cost_unavailable", index=i, reason="unknown full cost; equal-share bootstrap cap is heuristic, not a guarantee", worker_cap_seconds=cap)
+                has_complete_inc = any(
+                    complete(rr, protocol["full_epochs"]) and (
+                        objective.max_memory is None or float(rr.get("memory_mb") or 0.0) <= float(objective.max_memory)
+                    )
+                    for k_rows in state["results"].values() for rr in k_rows
+                )
+                if method == "conformal_mf" and has_conformal_card and has_complete_inc:
+                    cap = max(0.0, (remaining() - cleanup) / need)
+                else:
+                    if plan is not None and plan * need + cleanup > remaining():
+                        ledger.emit("candidate_unresolved", index=i, reason="all-seed finalizer forecast exceeds remaining budget", forecast=forecast)
+                        return
+                    if plan is None:
+                        # With no evidence no policy can promise affordability.
+                        # Share the unknown bootstrap budget across required seeds
+                        # instead of letting one unknown worker consume it all.
+                        cap = max(0, (remaining() - cleanup) / need)
+                        ledger.emit("candidate_cost_unavailable", index=i, reason="unknown full cost; equal-share bootstrap cap is heuristic, not a guarantee", worker_cap_seconds=cap)
             result = attempt(i, seed, True, cap)
             if result is None or not complete(result, protocol["full_epochs"]):
                 return
@@ -535,8 +545,91 @@ def run_search(protocol, evaluate, remaining, ledger, initial=None, on_change=No
         _run_tpe_loop()
         order = []
 
+    if method == "constrained_bo":
+        # Gelbart et al. (2014) Constrained Expected Improvement (cEI):
+        # Independent quality GP (GP-LOOCV) * latent log-memory GP constraint feasibility probability.
+        from scipy.special import ndtr
+        from .acquisition import _kernel_matrix, configuration_distances, rank_candidates
+
+        distances, _ = configuration_distances(protocol)
+        limit_mb, _ = _effective_memory_limit(objective, protocol)
+        attempted_cbo = set()
+        while remaining() > cleanup:
+            rows = measurements(configs, state["results"], seeds, protocol["full_epochs"], objective)
+            forecasts = {i: cost_model.estimate(i) for i in range(len(configs))}
+            affordable = []
+            for i in order:
+                if i in attempted_cbo or not missing(i):
+                    continue
+                prior = state["results"][str(i)]
+                if any(ar.get("status") in {"oom", "config_mismatch", "training_evidence_missing"} for ar in prior):
+                    continue
+                plan = forecasts[i].get("planning_seconds")
+                if plan is None or plan * len(missing(i)) + cleanup <= remaining():
+                    affordable.append(i)
+            if not affordable:
+                break
+
+            mem_indices, mem_logs = [], []
+            for i_m, r_list in state["results"].items():
+                idx_m = int(i_m)
+                vals = [
+                    float(ar["memory_mb"]) for ar in r_list
+                    if isinstance(ar.get("memory_mb"), (int, float))
+                    and not isinstance(ar.get("memory_mb"), bool)
+                    and math.isfinite(ar["memory_mb"]) and float(ar["memory_mb"]) > 0
+                ]
+                if vals:
+                    mem_indices.append(idx_m)
+                    mem_logs.append(math.log(max(vals)))
+                elif limit_mb is not None and any(ar.get("status") == "oom" for ar in r_list):
+                    mem_indices.append(idx_m)
+                    mem_logs.append(math.log(max(1.0, 1.35 * limit_mb)))
+
+            p_mem_gauss = {i: 1.0 for i in range(len(configs))}
+            if limit_mb is not None and len(mem_indices) >= 2:
+                import numpy as _np
+                y_lm = _np.asarray(mem_logs, dtype=float)
+                m_lm = float(_np.mean(y_lm))
+                k_m = _kernel_matrix(distances, "matern52", 0.90)
+                gram_m = k_m[_np.ix_(mem_indices, mem_indices)] + 0.05 * _np.eye(len(mem_indices))
+                try:
+                    solved_m = _np.linalg.solve(gram_m, _np.column_stack((y_lm - m_lm, k_m[:, mem_indices].T)))
+                    alpha_m, proj_m = solved_m[:, 0], solved_m[:, 1:].T
+                    s2_m = max(0.02, float(_np.var(y_lm)))
+                    log_lim = math.log(max(1.0, float(limit_mb)))
+                    for j in range(len(configs)):
+                        mu_j = m_lm + float(k_m[j, mem_indices] @ alpha_m)
+                        lev_j = float(_np.clip(1.0 - float(k_m[j, mem_indices] @ proj_m[j]), 0.0, 1.0))
+                        sig_j = max(0.08, math.sqrt(max(1e-6, s2_m * lev_j)))
+                        p_mem_gauss[j] = float(ndtr((log_lim - mu_j) / sig_j))
+                except _np.linalg.LinAlgError:
+                    pass
+
+            n_complete = sum(1 for r in rows if r["complete"])
+            if len(attempted_cbo) < 2:
+                chosen = affordable[0]
+                cbo_reason = "constrained_bo_cold_start"
+            elif n_complete == 0:
+                chosen = max(affordable, key=lambda idx: (p_mem_gauss[idx], -order.index(idx)))
+                cbo_reason = "constrained_bo_memory_recovery"
+            else:
+                acq = rank_candidates(
+                    protocol, rows, forecasts,
+                    candidates=[{"index": i, "missing_seeds": missing(i)} for i in affordable],
+                    order=order, use_cost=True, use_uncertainty=True, use_diversity=True,
+                    acquisition_mode="rule", feasibility_weights=p_mem_gauss,
+                )
+                chosen = acq["ranking"][0]
+                cbo_reason = "constrained_bo_cei"
+            ledger.emit("constrained_bo_step", index=chosen, reason=cbo_reason, p_feasible=p_mem_gauss[chosen], remaining_seconds=remaining())
+            attempted_cbo.add(chosen)
+            confirm(chosen)
+        order = []
+
     if method in {"conformal_mf", "mf_no_conformal"}:
-        from .conformal_vram import calibrate_online_2point, predict_conformal_vram
+        from .acquisition import configuration_distances, rank_candidates
+        from .conformal_vram import calibrate_online_2point, conformal_feasibility_probability, predict_conformal_vram
         from .predictors import observed_cross_memory
 
         use_conformal = method == "conformal_mf"
@@ -545,6 +638,7 @@ def run_search(protocol, evaluate, remaining, ledger, initial=None, on_change=No
         conformal_alpha = float(protocol.get("scheduler", {}).get("conformal_alpha", 0.05))
         task_name = protocol.get("task", "detection")
         pruned_set = {rec["index"] for rec in state.get("conformal_pruned", []) if isinstance(rec, dict) and "index" in rec}
+        distances, _ = configuration_distances(protocol)
 
         def _record_pruned(idx, stage, pred_point, pred_upper, basis_str):
             if idx in pruned_set:
@@ -563,15 +657,26 @@ def run_search(protocol, evaluate, remaining, ledger, initial=None, on_change=No
             state.setdefault("conformal_pruned", []).append(rec)
             ledger.emit("conformal_vram_pruned", **rec)
 
-        # Stage 0: Pre-execution Conformal VRAM Filter
-        if use_conformal and card is not None and limit_mb is not None:
+        p_feas_map = {idx: 1.0 for idx in range(len(configs))}
+
+        def _refresh_conformal_bounds(stage_tag, current_online_cal=None):
+            if not (use_conformal and card is not None and limit_mb is not None):
+                return
             for idx in range(len(configs)):
+                desc_i = descriptor_for(protocol, configs[idx])
                 pred = predict_conformal_vram(
-                    card, configs[idx], descriptor_for(protocol, configs[idx]),
-                    alpha=conformal_alpha, task=task_name, protocol=protocol,
+                    card, configs[idx], desc_i,
+                    alpha=conformal_alpha, online_cal=current_online_cal, task=task_name, protocol=protocol,
                 )
-                if pred["upper_bound_mb"] > limit_mb:
-                    _record_pruned(idx, "stage0_offline_conformal", pred["point_mb"], pred["upper_bound_mb"], pred["basis"])
+                p_feas_map[idx] = conformal_feasibility_probability(
+                    card, configs[idx], limit_mb, descriptor=desc_i, online_cal=current_online_cal, task=task_name, protocol=protocol,
+                )
+                if pred["upper_bound_mb"] > limit_mb and idx not in pruned_set:
+                    if not any(r["index"] == idx for r in state["probes"]) and not any(complete(r, protocol["full_epochs"]) for r in state["results"][str(idx)]):
+                        _record_pruned(idx, stage_tag, pred["point_mb"], pred["upper_bound_mb"], pred["basis"])
+
+        # Stage 0: Unified Conformal VRAM Pre-Filter & Predictive Feasibility Assessment
+        _refresh_conformal_bounds("stage0_offline_conformal", None)
 
         # Collect existing VRAM anchors for resume compatibility
         online_anchors = []
@@ -583,49 +688,68 @@ def run_search(protocol, evaluate, remaining, ledger, initial=None, on_change=No
                     "memory_mb": float(pr["memory_mb"]),
                 })
         online_cal = calibrate_online_2point(card, online_anchors, task=task_name, protocol=protocol) if (use_conformal and card is not None and online_anchors) else None
+        if online_cal is not None:
+            _refresh_conformal_bounds("stage0_resume_calibrated_conformal", online_cal)
 
-        # Stage 1: Multi-fidelity short-horizon probe screening
-        if use_conformal:
-            probe_order = sorted((i for i in order if i not in pruned_set), key=lambda i: (small_first_key(protocol, i), order.index(i)))
+        # Stage 1: Seed-Stratified Facility-Location (K-Medoid) Multi-Fidelity Screening
+        safe_candidates = [i for i in range(len(configs)) if i not in pruned_set]
+        if protocol["probe_epochs"] >= protocol["full_epochs"] or len(safe_candidates) <= 2:
+            target_probes = 0
         else:
-            probe_order = list(order)
+            target_probes = min(
+                4 if (task_name != "detection" and len(safe_candidates) >= 12) else 3 if len(safe_candidates) >= 9 else 2,
+                max(1, (len(safe_candidates) + 1) // 2),
+            )
 
-        mf_probe_fraction = min(max(float(protocol["scheduler"].get("probe_fraction", 0.1)), 0.18), 0.25)
+        if use_conformal and card is not None and safe_candidates:
+            rng_probe = random.Random(protocol["search_seed"])
+            sorted_safe = sorted(safe_candidates, key=lambda i: (small_first_key(protocol, i), order.index(i)))
+            fast_tier = sorted_safe[:max(2, (len(sorted_safe) + 2) // 3)]
+            p0 = rng_probe.choice(fast_tier)
+            probe_order = [p0]
+            rem_pool = [i for i in sorted_safe if i != p0]
+            while rem_pool:
+                next_p = min(
+                    rem_pool,
+                    key=lambda j: (
+                        sum(min(float(distances[u, c]) for c in probe_order + [j]) for u in safe_candidates)
+                        - 0.08 * float(all(configs[j].get("model") != configs[c].get("model") for c in probe_order))
+                        + 1e-3 * rng_probe.random()
+                    ),
+                )
+                probe_order.append(next_p)
+                rem_pool.remove(next_p)
+        else:
+            probe_order = [i for i in order if i not in pruned_set]
+
+        mf_probe_fraction = min(max(float(protocol["scheduler"].get("probe_fraction", 0.1)), 0.20), 0.28)
         probe_allowance = protocol["budget_seconds"] * mf_probe_fraction
         existing_probes = {r["index"]: r for r in state["probes"]}
-        risk_gated_to_tpe = False
-        max_stage1_probes = 2
         stage1_probes_done = sum(1 for r in state["probes"] if r.get("status") == "ok")
 
         for idx in probe_order:
             if idx in existing_probes or idx in pruned_set:
                 continue
-            if stage1_probes_done >= max_stage1_probes:
+            if stage1_probes_done >= target_probes:
                 break
-            if use_conformal and limit_mb is not None and online_anchors:
-                desc_i = descriptor_for(protocol, configs[idx])
-                if card is not None:
-                    pred_i = predict_conformal_vram(card, configs[idx], desc_i, alpha=conformal_alpha, online_cal=online_cal, task=task_name, protocol=protocol)
-                    if pred_i["upper_bound_mb"] > limit_mb:
-                        _record_pruned(idx, "stage1_online_calibrated_conformal", pred_i["point_mb"], pred_i["upper_bound_mb"], pred_i["basis"])
-                        continue
-                elif len(online_anchors) >= 2:
-                    merged_obs = {}
-                    for pr in state["probes"]:
-                        if pr.get("status") == "ok" and isinstance(pr.get("memory_mb"), (int, float)):
-                            merged_obs.setdefault(pr["index"], []).append(pr)
-                    for k_idx, k_rows in state["results"].items():
-                        ok_rows = [r for r in k_rows if r.get("status") == "ok" and isinstance(r.get("memory_mb"), (int, float))]
-                        if ok_rows:
-                            merged_obs.setdefault(int(k_idx), []).extend(ok_rows)
-                    mem_est = observed_cross_memory(protocol, merged_obs, idx)
-                    if mem_est and mem_est["point_mb"] * 1.12 > limit_mb:
-                        _record_pruned(idx, "stage1_online_physical_safety", mem_est["point_mb"], mem_est["point_mb"] * 1.12, mem_est["basis"])
-                        continue
+            if use_conformal and limit_mb is not None and online_anchors and card is None and len(online_anchors) >= 2:
+                merged_obs = {}
+                for pr in state["probes"]:
+                    if pr.get("status") == "ok" and isinstance(pr.get("memory_mb"), (int, float)):
+                        merged_obs.setdefault(pr["index"], []).append(pr)
+                for k_idx, k_rows in state["results"].items():
+                    ok_rows = [r for r in k_rows if r.get("status") == "ok" and isinstance(r.get("memory_mb"), (int, float))]
+                    if ok_rows:
+                        merged_obs.setdefault(int(k_idx), []).extend(ok_rows)
+                mem_est = observed_cross_memory(protocol, merged_obs, idx)
+                if mem_est and mem_est["point_mb"] * 1.12 > limit_mb:
+                    _record_pruned(idx, "stage1_online_physical_safety", mem_est["point_mb"], mem_est["point_mb"] * 1.12, mem_est["basis"])
+                    p_feas_map[idx] = 0.05
+                    continue
 
             if probe_spent >= probe_allowance:
                 break
-            if stage1_probes_done >= 2 and remaining() <= cleanup + 0.70 * protocol["budget_seconds"]:
+            if stage1_probes_done >= 1 and remaining() <= cleanup + 0.65 * protocol["budget_seconds"]:
                 break
             cap = min(max(cleanup, probe_allowance - probe_spent + cleanup), remaining() - cleanup)
             if cap < cleanup:
@@ -635,44 +759,19 @@ def run_search(protocol, evaluate, remaining, ledger, initial=None, on_change=No
                 break
             if res.get("status") == "ok" and isinstance(res.get("memory_mb"), (int, float)) and math.isfinite(res["memory_mb"]):
                 stage1_probes_done += 1
-                if use_conformal:
+                if use_conformal and card is not None:
                     online_anchors.append({
                         "config": configs[idx],
                         "descriptor": descriptor_for(protocol, configs[idx]),
                         "memory_mb": float(res["memory_mb"]),
                     })
-                    if card is not None:
-                        online_cal = calibrate_online_2point(card, online_anchors, task=task_name, protocol=protocol)
-                    elif not pruned_set and len(online_anchors) >= 2:
-                        max_anchor_mb = max(a["memory_mb"] for a in online_anchors)
-                        if limit_mb is None or max_anchor_mb < 0.50 * limit_mb:
-                            risk_gated_to_tpe = True
-                            ledger.emit(
-                                "conformal_mf_risk_gate",
-                                mode="risk_gated_tpe_handoff",
-                                n_probes=len(online_anchors),
-                                max_probe_mb=float(max_anchor_mb),
-                                limit_mb=limit_mb,
-                                limit_kind=limit_kind,
-                                remaining_seconds=remaining(),
-                            )
-                            break
+                    online_cal = calibrate_online_2point(card, online_anchors, task=task_name, protocol=protocol)
+                    _refresh_conformal_bounds("stage1_online_calibrated_conformal", online_cal)
 
-        # Re-check unprobed configs once with online-calibrated Conformal bounds
-        if use_conformal and card is not None and limit_mb is not None and online_cal is not None and not risk_gated_to_tpe:
-            for idx in probe_order:
-                if idx in pruned_set or any(r["index"] == idx for r in state["probes"]):
-                    continue
-                pred_i = predict_conformal_vram(card, configs[idx], descriptor_for(protocol, configs[idx]), alpha=conformal_alpha, online_cal=online_cal, task=task_name, protocol=protocol)
-                if pred_i["upper_bound_mb"] > limit_mb:
-                    _record_pruned(idx, "stage1_online_calibrated_conformal", pred_i["point_mb"], pred_i["upper_bound_mb"], pred_i["basis"])
-
-        # Rank screened candidates consistently with the locked selection rule
+        # Collect screened probe outcomes & continuous multi-fidelity probe prior
         probe_by_idx = {}
         for r in state["probes"]:
             probe_by_idx[r["index"]] = r
-        weights = [w / sum(objective.weights) for w in objective.weights]
-        wt, wm = weights[1], weights[2]
         valid_probes = []
         failed_probes = set()
         for idx, r in probe_by_idx.items():
@@ -688,99 +787,118 @@ def run_search(protocol, evaluate, remaining, ledger, initial=None, on_change=No
             elif r.get("status") in {"oom", "config_mismatch", "training_evidence_missing"}:
                 failed_probes.add(idx)
 
-        if risk_gated_to_tpe:
-            save()
-            _run_tpe_loop(excluded=pruned_set | failed_probes)
-            order = []
-        else:
-            if use_conformal:
-                ledger.emit("conformal_mf_risk_gate", mode="conformal_mf_vram_stress", n_pruned=len(pruned_set), n_probes=len(probe_by_idx), limit_mb=limit_mb, limit_kind=limit_kind)
-            max_probe_q = max((r["quality"] for _, r in valid_probes), default=0.0)
-            max_probe_t = max((max(1e-6, float(r.get("worker_wall_seconds", 1.0))) for _, r in valid_probes), default=1.0)
-            rule = protocol.get("selection_rule", "weighted")
-            eps_probe = max(0.05, float(protocol.get("quality_tolerance", 0.03)))
+        probe_priors = {idx: float(r["quality"]) for idx, r in valid_probes}
+        if use_conformal:
+            ledger.emit(
+                "conformal_mf_stage_summary",
+                mode="cc_mfbo_unified",
+                pruned=sorted(pruned_set),
+                probed=sorted(probe_priors),
+                target_probes=target_probes,
+                limit_mb=limit_mb,
+                limit_kind=limit_kind,
+                online_calibration=online_cal,
+            )
+        save()
 
-            def _probe_rank_score(item):
-                idx, r = item
-                q = float(r["quality"])
-                t = max(1e-6, float(r.get("worker_wall_seconds", 1.0)))
-                m = float(r["memory_mb"])
-                est_full = cost_model.estimate(idx).get("point_seconds")
-                t_proxy = float(est_full) if isinstance(est_full, (int, float)) and math.isfinite(est_full) else (t / max_probe_t) * float(objective.time_scale)
-                if rule == "epsilon_constraint":
-                    tl = t_proxy / float(objective.time_scale)
-                    ml = m / float(objective.memory_scale)
-                    denom_tm = wt + wm
-                    c_cost = (wt * tl + wm * ml) / denom_tm if denom_tm > 1e-12 else 0.5 * (tl + ml)
-                    gap = max(0.0, max_probe_q - q)
-                    sc = (1.0 - c_cost / (1.0 + max(0.0, c_cost)) + 1e-4 * q) if gap <= eps_probe + 1e-12 else (-gap - 0.1 * c_cost / (1.0 + max(0.0, c_cost)))
-                    return (sc, q, -idx)
-                u = objective.value({"quality_mean": q, "time_mean": t_proxy, "memory_max": m})
-                return (u, q, -idx)
+        # Stage 2: Unified Multi-Fidelity Residual GP-LOOCV + Conformal cEUI Confirmation Loop
+        safe_order = [i for i in probe_order if i not in pruned_set and i not in failed_probes]
+        attempted_full = set()
+        while remaining() > cleanup:
+            rows = measurements(configs, state["results"], seeds, protocol["full_epochs"], objective)
+            obs_full_w = [
+                float(rr["worker_wall_seconds"])
+                for k_rows in state["results"].values()
+                for rr in k_rows
+                if complete(rr, protocol["full_epochs"]) and rr.get("worker_wall_seconds")
+            ]
+            obs_probe_w = {
+                r["index"]: float(r["worker_wall_seconds"])
+                for r in state["probes"]
+                if r.get("status") == "ok" and r.get("worker_wall_seconds")
+            }
+            med_probe_w = statistics.median(obs_probe_w.values()) if obs_probe_w else None
+            med_full_w = statistics.median(obs_full_w) if obs_full_w else None
+            n_complete = sum(1 for r in rows if r["complete"])
 
-            promoted = [idx for idx, _ in sorted(valid_probes, key=_probe_rank_score, reverse=True)]
-            unprobed = [i for i in probe_order if i not in pruned_set and i not in promoted and i not in failed_probes]
-            safe_order = promoted + unprobed
-            ledger.emit("conformal_mf_stage_summary", method=method, pruned=sorted(pruned_set),
-                        probed=list(probe_by_idx), promoted=promoted, online_calibration=online_cal)
-            save()
-
-            # Stage 2: Adaptive GP LOOCV full-confirmation loop on screened space
-            from .acquisition import rank_candidates
-            attempted_full = set()
-            while remaining() > cleanup:
-                rows = measurements(configs, state["results"], seeds, protocol["full_epochs"], objective)
-                forecasts = {}
-                eligible_full = []
-                for idx in safe_order:
-                    if idx in attempted_full or idx in pruned_set or not missing(idx):
-                        continue
-                    prior = state["results"][str(idx)]
-                    if any(ar.get("status") in {"oom", "config_mismatch", "training_evidence_missing"} for ar in prior):
-                        continue
-                    fc = cost_model.estimate(idx)
-                    forecasts[idx] = fc
-                    if use_conformal and limit_mb is not None:
-                        if card is not None:
-                            pred_c = predict_conformal_vram(card, configs[idx], descriptor_for(protocol, configs[idx]), alpha=conformal_alpha, online_cal=online_cal, task=task_name, protocol=protocol)
-                            if pred_c["upper_bound_mb"] > limit_mb:
-                                _record_pruned(idx, "stage2_online_conformal", pred_c["point_mb"], pred_c["upper_bound_mb"], pred_c["basis"])
-                                continue
-                        else:
-                            risk_lvl, _, _ = _memory_risk(fc, objective, protocol, prior)
-                            if risk_lvl in {"hard_exceeds_max_memory", "hard_exceeds_vram_free", "observed_seed_exceeded_max_memory", "observed_seed_exceeded_vram_free"}:
-                                continue
-                    plan = fc.get("planning_seconds")
+            forecasts = {}
+            eligible_full = []
+            for idx in safe_order:
+                if idx in attempted_full or idx in pruned_set or not missing(idx):
+                    continue
+                prior = state["results"][str(idx)]
+                if any(ar.get("status") in {"oom", "config_mismatch", "training_evidence_missing"} for ar in prior):
+                    continue
+                fc = cost_model.estimate(idx)
+                if any(complete(ar, protocol["full_epochs"]) for ar in prior):
+                    mf_fc = fc
+                else:
+                    raw_pt = fc.get("point_seconds")
+                    if med_full_w is not None:
+                        ratio = (float(raw_pt) / med_full_w) if (raw_pt and med_full_w > 0) else 1.0
+                        pt_s = med_full_w * min(1.55, max(0.70, ratio ** 0.30))
+                        if idx in obs_probe_w and med_probe_w and med_probe_w > 0:
+                            pt_s *= (obs_probe_w[idx] / med_probe_w) ** 0.5
+                    elif obs_probe_w:
+                        p_w = obs_probe_w.get(idx, med_probe_w)
+                        pt_s = p_w * max(1.5, (protocol["full_epochs"] / max(1, protocol["probe_epochs"])) * 0.65)
+                    else:
+                        pt_s = raw_pt
+                    if pt_s is not None:
+                        mf_fc = dict(fc, point_seconds=float(pt_s), planning_seconds=float(1.15 * pt_s))
+                    else:
+                        mf_fc = fc
+                forecasts[idx] = mf_fc
+                if use_conformal and limit_mb is not None:
+                    if card is not None:
+                        desc_c = descriptor_for(protocol, configs[idx])
+                        pred_c = predict_conformal_vram(card, configs[idx], desc_c, alpha=conformal_alpha, online_cal=online_cal, task=task_name, protocol=protocol)
+                        p_feas_map[idx] = conformal_feasibility_probability(card, configs[idx], limit_mb, descriptor=desc_c, online_cal=online_cal, task=task_name, protocol=protocol)
+                        if pred_c["upper_bound_mb"] > limit_mb:
+                            _record_pruned(idx, "stage2_online_conformal", pred_c["point_mb"], pred_c["upper_bound_mb"], pred_c["basis"])
+                            continue
+                    else:
+                        risk_lvl, _, _ = _memory_risk(mf_fc, objective, protocol, prior)
+                        if risk_lvl in {"hard_exceeds_max_memory", "hard_exceeds_vram_free", "observed_seed_exceeded_max_memory", "observed_seed_exceeded_vram_free"}:
+                            continue
+                if use_conformal and card is not None:
+                    if n_complete >= 1 and obs_full_w:
+                        if 0.75 * min(obs_full_w) * len(missing(idx)) + cleanup > remaining():
+                            continue
+                else:
+                    plan = mf_fc.get("planning_seconds")
                     if plan is not None and plan * len(missing(idx)) + cleanup > remaining():
                         continue
-                    eligible_full.append({"index": idx, "missing_seeds": missing(idx)})
-                if not eligible_full:
-                    break
-                n_complete = sum(1 for r in rows if r["complete"])
-                if n_complete == 0:
-                    chosen = eligible_full[0]["index"]
-                    reason = "stage2_probe_bootstrap"
-                    acq_payload = {"ranking": [chosen], "scores": {}}
-                else:
-                    acq_payload = rank_candidates(
-                        protocol, rows, forecasts, candidates=eligible_full, order=safe_order,
-                        use_cost=True, use_uncertainty=True, use_diversity=True, acquisition_mode="rule",
-                    )
-                    chosen = acq_payload["ranking"][0]
-                    reason = "stage2_gp_loocv_acquisition"
-                ledger.emit("conformal_mf_acquisition", index=chosen, reason=reason, remaining_seconds=remaining(), ranking=acq_payload.get("ranking"))
-                attempted_full.add(chosen)
-                confirm(chosen)
-                if use_conformal and card is not None:
-                    ok_full = [r for r in state["results"][str(chosen)] if complete(r, protocol["full_epochs"])]
-                    if ok_full:
-                        online_anchors.append({
-                            "config": configs[chosen],
-                            "descriptor": descriptor_for(protocol, configs[chosen]),
-                            "memory_mb": float(max(r["memory_mb"] for r in ok_full)),
-                        })
-                        online_cal = calibrate_online_2point(card, online_anchors, task=task_name, protocol=protocol)
-            order = []
+                eligible_full.append({"index": idx, "missing_seeds": missing(idx)})
+            if not eligible_full:
+                break
+            if n_complete == 0 and not probe_priors:
+                chosen = eligible_full[0]["index"]
+                reason = "stage2_cold_bootstrap"
+                acq_payload = {"ranking": [chosen], "scores": {}}
+            else:
+                acq_payload = rank_candidates(
+                    protocol, rows, forecasts, candidates=eligible_full, order=safe_order,
+                    use_cost=True, use_uncertainty=True, use_diversity=True, acquisition_mode="rule",
+                    probe_priors=probe_priors if probe_priors else None,
+                    feasibility_weights=p_feas_map if use_conformal else None,
+                )
+                chosen = acq_payload["ranking"][0]
+                reason = "stage2_mf_residual_gp_ceui"
+            ledger.emit("conformal_mf_acquisition", index=chosen, reason=reason, p_feas=p_feas_map.get(chosen, 1.0), remaining_seconds=remaining(), ranking=acq_payload.get("ranking"))
+            attempted_full.add(chosen)
+            confirm(chosen)
+            if use_conformal and card is not None:
+                ok_full = [r for r in state["results"][str(chosen)] if complete(r, protocol["full_epochs"])]
+                if ok_full:
+                    online_anchors.append({
+                        "config": configs[chosen],
+                        "descriptor": descriptor_for(protocol, configs[chosen]),
+                        "memory_mb": float(max(r["memory_mb"] for r in ok_full)),
+                    })
+                    online_cal = calibrate_online_2point(card, online_anchors, task=task_name, protocol=protocol)
+                    _refresh_conformal_bounds("stage2_online_conformal", online_cal)
+        order = []
 
     if method == "prior_full":
         # Scheduling only. Missing/OOD predictions keep metadata order; every

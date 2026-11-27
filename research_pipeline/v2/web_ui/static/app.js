@@ -476,12 +476,15 @@
     }
 
     const METHOD_LABELS = {
-      conformal_mf: "conformal_mf (Split Conformal VRAM + Multi-Fidelity · Risk-Gated)",
+      conformal_mf: "conformal_mf (CC-MFBO: Split Conformal VRAM + Multi-Fidelity Residual GP)",
       mf_no_conformal: "mf_no_conformal (Multi-Fidelity không lọc Conformal)",
+      constrained_bo: "constrained_bo (Bayesian Optimization có ràng buộc Gaussian cEI)",
       tpe_bo: "tpe_bo (Bayesian Optimization TPE · KDE Parzen)",
       adaptive_full: "adaptive_full (GP Kernel Ridge LOOCV · Full-data)",
       adaptive_ehvi: "adaptive_ehvi (3D Pareto Hypervolume EHVI)",
       adaptive_staged_seeds: "adaptive_staged_seeds (Đo tuần tự seed dẫn đầu)",
+      successive_halving: "successive_halving (Loại dần đa tầng Successive Halving)",
+      reserve: "reserve (Thăm dò dự phòng ngân sách)",
       random: "random (Ngẫu nhiên có kiểm soát)",
       default: "default (Chỉ cấu hình c00 mặc định)",
     };
@@ -513,7 +516,7 @@
       const mode = document.getElementById("launch-mode").value;
       const modelsVal = selectedModelsList();
       const selectedMethod = methodSel.value || "conformal_mf";
-      const bmMethods = Array.from(new Set([selectedMethod, "conformal_mf", "mf_no_conformal", "adaptive_full", "tpe_bo", "random"]));
+      const bmMethods = Array.from(new Set([selectedMethod, "conformal_mf", "adaptive_full", "constrained_bo", "mf_no_conformal", "successive_halving", "tpe_bo", "random", "default"]));
       const cardVal = cardSel ? cardSel.value.trim() : "";
       const tolRaw = tolInput ? tolInput.value.trim() : "";
       const maxMemRaw = maxMemInput ? maxMemInput.value.trim() : "";

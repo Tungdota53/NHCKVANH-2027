@@ -203,7 +203,7 @@ def _exact_3d_ehvi(mu_q, sigma_q, time_s, mem_mb, front_points, t_scale, m_scale
     return float(max(0.0, ehvi))
 
 
-def _rule_evaluator(protocol, objective, observations):
+def _rule_evaluator(protocol, objective, observations, q_star_override=None):
     rule = protocol.get("selection_rule", "weighted")
     weights = [w / sum(objective.weights) for w in objective.weights]
     t_scale = float(objective.time_scale)
@@ -221,6 +221,8 @@ def _rule_evaluator(protocol, objective, observations):
     if rule == "epsilon_constraint":
         eps = max(0.0, float(protocol.get("quality_tolerance", 0.03)))
         q_star = max((float(obs["quality_mean"]) for obs in observations if obs.get("feasible")), default=0.0)
+        if q_star_override is not None:
+            q_star = max(q_star, float(q_star_override))
         wt, wm = weights[1], weights[2]
         denom_tm = wt + wm
         def eps_val(q, t, m):
@@ -392,7 +394,7 @@ def _fit_heteroscedastic_gp_loocv(protocol, spec, distances, observations, train
 
 def rank_candidates(protocol, rows, forecasts, candidates=None, order=None,
                     use_cost=True, use_uncertainty=True, use_diversity=True,
-                    acquisition_mode="auto"):
+                    acquisition_mode="auto", probe_priors=None, feasibility_weights=None):
     """Rank unfinished full confirmations; the coordinator owns admission/budget.
 
     candidates accepts indices or {index, missing_seeds/missing_seed_count}.
@@ -554,17 +556,119 @@ def rank_candidates(protocol, rows, forecasts, candidates=None, order=None,
                                               "No-diversity removes the explicit novelty bonus, not feature distances used by the surrogate.",
                                               "No test, reference or subset quality is an acquisition input."]}}
 
-    gp = _fit_heteroscedastic_gp_loocv(protocol, spec, distances, observations, train_indices, y, prior, sample_variance)
+    n_configs = len(protocol["configs"])
+    probe_items = (
+        sorted((int(k), float(v)) for k, v in probe_priors.items()
+               if 0 <= int(k) < n_configs and isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v))
+        if isinstance(probe_priors, dict) and probe_priors else []
+    )
+    if len(probe_items) >= 2:
+        raw_vals = [p[1] for p in probe_items]
+        pm = statistics.mean(raw_vals)
+        ps = statistics.stdev(raw_vals)
+        target_sd = max(ps, 0.075)
+        rho = min(3.0, target_sd / max(1e-4, ps)) if ps > 1e-5 else 1.0
+        probe_items = [
+            (idx_p, float(min(0.98, max(0.01, pm + rho * (val_p - pm)))))
+            for idx_p, val_p in probe_items
+        ]
+    m_probe = None
+    lev_probe = None
+    if probe_items:
+        p_idx = [p[0] for p in probe_items]
+        p_q = np.asarray([p[1] for p in probe_items], dtype=float)
+        p_mean = float(np.mean(p_q))
+        try:
+            k_p = _kernel_matrix(distances, "matern52", 0.90)
+            gram_p = k_p[np.ix_(p_idx, p_idx)] + 0.08 * np.eye(len(p_idx))
+            solved_p = np.linalg.solve(gram_p, np.column_stack((p_q - p_mean, k_p[:, p_idx].T)))
+            if np.isfinite(solved_p).all():
+                alpha_p, proj_p = solved_p[:, 0], solved_p[:, 1:].T
+                m_probe = np.clip(p_mean + k_p[:, p_idx] @ alpha_p, 0.0, 1.0)
+                lev_probe = [float(np.clip(1.0 - float(k_p[j, p_idx] @ proj_p[j]), 0.0, 1.0)) for j in range(n_configs)]
+        except (np.linalg.LinAlgError, ValueError):
+            m_probe = None
+        if m_probe is None:
+            m_probe = np.full(n_configs, p_mean, dtype=float)
+            for idx_p, q_p in probe_items:
+                m_probe[idx_p] = float(np.clip(q_p, 0.0, 1.0))
+            lev_probe = [0.2 if j in p_idx else 1.0 for j in range(n_configs)]
+
+    if m_probe is not None and count == 0:
+        p_var = float(np.var([p[1] for p in probe_items])) if len(probe_items) > 1 else 0.03
+        gp = {
+            "fitted": True, "fit_warning": None,
+            "selected_kernel": "matern52_mf_probe", "selected_ls": 0.90,
+            "selected_ridge": 0.08, "loocv_mae": None, "loocv_rmse": None,
+            "heteroscedastic": False, "noise_variances": [], "grid_size_evaluated": 1,
+            "residual_variance": p_var,
+            "means": [float(v) for v in m_probe],
+            "stds": [float(math.sqrt(max(1e-4, min(0.05, max(0.015, p_var)) * lv))) for lv in lev_probe],
+            "leverages": lev_probe,
+        }
+    elif m_probe is not None and count == 1:
+        p_var = float(np.var([p[1] for p in probe_items])) if len(probe_items) > 1 else 0.03
+        delta_shift = float(np.mean(y - m_probe[train_indices]))
+        m_prior_vec = np.clip(m_probe + delta_shift, 0.0, 1.0)
+        gp = _fit_heteroscedastic_gp_loocv(protocol, spec, distances, observations, train_indices, y, prior, sample_variance)
+        lev_joint = [min(float(lf), 0.5 * (float(lf) + float(lp))) for lf, lp in zip(gp["leverages"], lev_probe)]
+        sig2_mf = min(0.04, max(0.012, p_var))
+        gp["means"] = [float(v) for v in m_prior_vec]
+        gp["leverages"] = lev_joint
+        gp["stds"] = [float(math.sqrt(max(1e-4, sig2_mf * lj))) for lj in lev_joint]
+        gp["selected_kernel"] = f"{gp['selected_kernel']}_mf_prior"
+    elif m_probe is not None and count >= 2:
+        delta_shift = float(np.mean(y - m_probe[train_indices]))
+        m_prior_vec = np.clip(m_probe + delta_shift, 0.0, 1.0)
+        y_res = y - m_prior_vec[train_indices]
+        y_shifted = np.clip(0.5 + y_res, 0.0, 1.0)
+        res_var = float(np.var(y_shifted))
+        res_gp = _fit_heteroscedastic_gp_loocv(protocol, spec, distances, observations, train_indices, y_shifted, 0.5, res_var)
+        gp = dict(res_gp)
+        gp["selected_kernel"] = f"{res_gp['selected_kernel']}_mf_residual"
+        gp["means"] = [float(np.clip(m_prior_vec[j] + (res_gp["means"][j] - 0.5), 0.0, 1.0)) for j in range(n_configs)]
+    else:
+        gp = _fit_heteroscedastic_gp_loocv(protocol, spec, distances, observations, train_indices, y, prior, sample_variance)
     fitted = gp["fitted"]
     fit_warning = gp["fit_warning"]
     residual_variance = gp["residual_variance"]
 
     selection_rule = protocol.get("selection_rule", "weighted")
-    rule_fn, rule_fallback = _rule_evaluator(protocol, objective, observations)
+    q_star_override = max((gp["means"][idx] for idx in missing), default=None) if m_probe is not None else None
+    rule_fn, rule_fallback = _rule_evaluator(protocol, objective, observations, q_star_override=q_star_override)
     feasible_obs = [obs for obs in observations if obs["feasible"]]
     ref_rows = feasible_obs if feasible_obs else observations
     target_u = incumbent if incumbent is not None else max((row["utility"] if row["utility"] is not None else objective.value(row) for row in observations), default=0.0)
     target_r = max((rule_fn(r["quality_mean"], r["time_mean"], r["memory_max"]) for r in ref_rows), default=0.0)
+
+    def _eps_post_gain(q_pt, t_pt, m_pt):
+        eps_tol = max(0.0, float(protocol.get("quality_tolerance", 0.03)))
+        q_obs_max = max((float(obs["quality_mean"]) for obs in ref_rows), default=0.0)
+        weights_n = [w / sum(objective.weights) for w in objective.weights]
+        wt, wm = weights_n[1], weights_n[2]
+        denom_tm = wt + wm
+        def _c_cost(t_v, m_v):
+            tl = float(t_v) / float(objective.time_scale)
+            ml = float(m_v) / float(objective.memory_scale)
+            return (wt * tl + wm * ml) / denom_tm if denom_tm > 1e-12 else 0.5 * (tl + ml)
+        if not ref_rows:
+            q_anchor = float(q_star_override) if q_star_override is not None else float(q_pt)
+            gap0 = max(0.0, q_anchor - float(q_pt))
+            if gap0 > eps_tol + 1e-12:
+                return 0.0
+            cc = _c_cost(t_pt, m_pt)
+            return max(0.0, 0.25 + 0.75 * float(q_pt) - 0.10 * (cc / (1.0 + max(0.0, cc))))
+        q_world = max(q_obs_max, float(q_pt))
+        def _s_at(qv, tv, mv):
+            cc = _c_cost(tv, mv)
+            gap = max(0.0, q_world - float(qv))
+            if gap <= eps_tol + 1e-12:
+                return bounded(1.0 - (cc / (1.0 + max(0.0, cc))) + 1e-4 * float(qv))
+            return bounded(-gap - 0.1 * (cc / (1.0 + max(0.0, cc))))
+        s_cand = _s_at(q_pt, t_pt, m_pt)
+        s_inc = max(_s_at(r["quality_mean"], r["time_mean"], r["memory_max"]) for r in ref_rows)
+        q_break = max(0.0, float(q_pt) - q_obs_max)
+        return max(0.0, s_cand - s_inc) + q_break
 
     all_times = [obs["time_mean"] for obs in observations] + known_costs + [default_time]
     all_memories = [obs["memory_max"] for obs in observations] + known_memories + [default_memory]
@@ -626,26 +730,42 @@ def rank_candidates(protocol, rows, forecasts, candidates=None, order=None,
             ucb_imp = max(0.0, ucb_u - target_u)
             gain = (ei_val + 0.25 * ucb_imp) * p_feas_q
         else:
+            if selection_rule == "epsilon_constraint":
+                def _imp_at(q_pt):
+                    return _eps_post_gain(q_pt, time, memory)
+            else:
+                def _imp_at(q_pt):
+                    return max(0.0, rule_fn(q_pt, time, memory) - target_r)
             if use_uncertainty and std_j > 1e-12:
                 ei_val = 0.0
                 for node, weight in zip(_GH_NODES, _GH_WEIGHTS):
                     q_pt = min(1.0, max(0.0, mean + _GH_SQRT2 * std_j * float(node)))
-                    ei_val += float(weight) * max(0.0, rule_fn(q_pt, time, memory) - target_r)
+                    ei_val += float(weight) * _imp_at(q_pt)
                 ei_val *= _GH_INV_SQRT_PI
             else:
-                ei_val = max(0.0, rule_fn(mean, time, memory) - target_r)
-            ucb_imp = max(0.0, rule_fn(optimistic, time, memory) - target_r)
+                ei_val = _imp_at(mean)
+            ucb_imp = _imp_at(optimistic)
             gain = (ei_val + 0.25 * ucb_imp + 0.5 * ehvi) * p_feas_q
 
-        diversity_bonus = spec["novelty_weight"] * novelty if use_diversity else 0.0
+        diversity_bonus = (
+            spec["novelty_weight"] * novelty * (0.15 if count == 0 else min(1.0, gain / 0.02))
+            if (use_diversity and m_probe is not None)
+            else (spec["novelty_weight"] * novelty if use_diversity else 0.0)
+        )
         numerator = max(1e-12, gain + diversity_bonus) if (fitted or count == 1) else (1.0 + diversity_bonus)
         remaining_cost = max(1e-9, bounded(time * need))
         resource_excess = ((max(0.0, memory / objective.max_memory - 1.0) if objective.max_memory else 0.0)
                            + (max(0.0, time / objective.max_time - 1.0) if objective.max_time else 0.0))
         planning_penalty = 1.0 / (1.0 + resource_excess)
-        score = bounded(numerator * planning_penalty / (remaining_cost if use_cost else 1.0))
+        feas_w = float(feasibility_weights.get(index, 1.0)) if isinstance(feasibility_weights, dict) else 1.0
+        feas_w = min(1.0, max(1e-4, feas_w))
+        score = bounded(feas_w * numerator * planning_penalty / (remaining_cost if use_cost else 1.0))
 
         reasons = ["heteroscedastic GP/adaptive kernel ridge LOOCV surrogate; not a statistical safety guarantee"]
+        if m_probe is not None:
+            reasons.append("multi-fidelity probe prior residual GP adjustment; final selection still requires full confirmations")
+        if feasibility_weights is not None:
+            reasons.append(f"feasibility-weighted expected utility p_feas={feas_w:.3f}")
         if fit_warning:
             reasons.append(fit_warning)
         elif not fitted:
@@ -670,6 +790,7 @@ def rank_candidates(protocol, rows, forecasts, candidates=None, order=None,
             "remaining_all_seed_cost_seconds": float(remaining_cost),
             "memory_prediction_mb": float(memory), "unknown_cost": unknown_time,
             "unknown_memory": unknown_memory, "planning_resource_penalty": float(planning_penalty),
+            "conformal_feasibility_weight": float(feas_w),
             "reasons": reasons, "quality_measured": False, "safety_guarantee": False,
         }
 
