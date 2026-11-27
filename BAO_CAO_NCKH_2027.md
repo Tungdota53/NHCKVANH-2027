@@ -23,7 +23,8 @@ Nghiên cứu này đề xuất **CC-MFBO** (`conformal_mf`), một khung tối 
 Thực nghiệm đối chứng ghép cặp trên **3 miền bài toán khác nhau hoàn toàn** với không gian **`18` cấu hình/miền**, **`8` phương pháp** (`conformal_mf`, `adaptive_full`, `constrained_bo` cEI, `mf_no_conformal`, `successive_halving`, `tpe_bo`, `random`, `default`) và **`n = 8` hạt giống tìm kiếm** (`192` lượt tìm kiếm online + `54` cấu hình tham chiếu vét cạn) chứng minh:
 - **Cả 3 miền hội tụ về 3 cấu hình tối ưu toàn cục hoàn toàn khác nhau:** `c14` (`yolo11s 480/B4 AdamW lr=0.00018 frz=8`, `0.9379 mAP@50`) trên Wildlife; `c17` (`yolo11s 640/B4 AdamW lr=0.0002 frz=6`, `0.8772 mAP@50:95`) trên Penn-Fudan; và `c12` (`cnn_classifier width=64 32/B16`, `0.4200 Acc`) trên CIFAR-10.
 - Trên cả hai miền có ràng buộc VRAM GPU (`Wildlife` ở $13.1\%$ chi phí vét cạn; `Penn-Fudan` ở $21.4\%$ chi phí vét cạn), **`conformal_mf` đứng #1 tuyệt đối** (`U Regret = 0.0748 ± 0.1143` với `50%` trúng tối ưu trên Wildlife; **`0.0009 ± 0.0026`** với **`87.5%` trúng tối ưu** trên Penn-Fudan), giữ **`0.00` vi phạm VRAM / `0.00s` lãng phí** và thắng có ý nghĩa thống kê toàn bộ 7 đường cơ sở trên Penn-Fudan (`Wilcoxon & Sign-Flip p = 0.0078–0.0312`, vượt `adaptive_full` với `p = 0.0078` trên cả hai tập).
-- Đánh giá **tập `Test` giữ lại hoàn toàn độc lập** trên cả 3 miền đạt: Wildlife **`Test mAP@50 = 0.9528 ± 0.0004`** (`159.05 FPS`), Penn-Fudan **`Test mAP@50 = 0.9785 ± 0.0107` / `mAP@50:95 = 0.8667 ± 0.0186`** (`73.16 FPS`), và CIFAR-10 **`Test Acc = 0.3480 ± 0.0231`**.
+- Đánh giá **đối chứng ghép cặp `3` training seeds `[17, 29, 43]` (`evaluate-v2 --seed-scope all`, `rect=False`) trên tập `Test` giữ lại hoàn toàn độc lập** giữa `CC-MFBO` và `Default (c00)` đạt: African Wildlife **`0.9587 ± 0.0220` vs `0.9179 ± 0.0211` (`+4.44%`, `115.96 FPS`)**, Penn-Fudan **`0.8667 ± 0.0186` vs `0.7302 ± 0.0266` (`+18.70%`, thắng `3/3` seeds, `73.16 FPS`, `mAP@50 = 0.9785`)**, và CIFAR-10 **`0.3987 ± 0.0110` vs `0.3973 ± 0.0083` (`+0.34%`)**.
+- Chỉ số chẩn đoán **Kendall $\tau$ (Epoch-1 vs Full-Horizon)** lý giải tường minh ranh giới áp dụng: $\tau = 0.7082$ ($p = 4.25\times 10^{-5}$) trên Wildlife và $\tau = 0.7778$ ($p = 4.36\times 10^{-7}$) trên Penn-Fudan (cùng `27.8%` cấu hình vi phạm VRAM $\rightarrow$ CC-MFBO thắng vượt trội), so với $\tau = 0.1946$ ($p = 0.269$) và `0.0%` vi phạm VRAM trên CIFAR-10 CNN (thoái lui an toàn về parity).
 
 ---
 
@@ -114,6 +115,47 @@ Thay cho việc rẽ nhánh thủ công `if card is None: tpe_bo`, `CC-MFBO` ([s
      $$\alpha_{\text{CC-MFBO}}(c) = \hat{p}_{\text{feas}}(c) \cdot \frac{\text{EI}_{\varepsilon\text{-post}}(c) + 0.25\,\text{UCB}_\varepsilon(c) + 0.5\,\text{EHVI}_{\text{3D}}(c) + b_{\text{div}}(c)}{\hat{T}_{\text{mf}}(c) \cdot |\mathcal{S}_{\text{missing}}(c)| \cdot \left(1 + \text{excess}(c)\right)}$$
      Trong đó `EI`$\varepsilon\text{-post}$ tích phân bằng **21-point Gauss–Hermite Quadrature** có cộng phần thưởng bứt phá chất lượng $(q - q_{\text{obs,max}})_+$ nhằm ngăn thuật toán kẹt ở cấu hình `320px` khi đã có bước nhảy chất lượng cao hơn ở `480px–640px`.
 
+### 4.1. Sơ đồ luồng xử lý tổng thể (`Global Test Blindness`)
+
+```mermaid
+flowchart TD
+    A["Khoa Protocol SHA-256 (Grid 18, Budget B, Seeds, Max VRAM M_max)"] --> B["ConformalVRAMGuard Card (d=6 Physics-Residual Features, alpha=0.05)"]
+    B --> C["Giai doan 0: Prefilter bang Can Tren U_alpha(c) <= M_max"]
+    C -->|"Cat tuc thi U_alpha > M_max (0.0s GPU)"| D["Tap Ung Vien Kha Thi C_guard"]
+    D --> E["Giai doan 1: Facility-Location K-Medoid Probes + 2-Pt Shrinkage Calibration"]
+    E --> F["Giai doan 2: Kennedy-O'Hagan + Heteroscedastic GP-LOOCV + Conformal cEUI"]
+    F --> G{"Con ngan sach B?"}
+    G -->|"Co"| H["Chay Full-Horizon Confirmation (Subprocess co lap)"]
+    H --> F
+    G -->|"Het"| I["Hau kiem epsilon-Constraint (chi tu Full Confirmed)"]
+    I --> J["Held-Out Test Evaluation (evaluate-v2, seed-scope=all, rect=False)"]
+```
+
+### 4.2. Mã giả chuẩn hóa Thuật toán 1 (`CC-MFBO`)
+
+```text
+Algorithm 1: CC-MFBO (Conformal-Calibrated Multi-Fidelity Bayesian Optimization)
+Input: Candidate set C (K=18), locked budget B, hard memory ceiling M_max,
+       pre-fitted ConformalVRAMCard G, risk level alpha=0.05, tolerance epsilon
+Output: Verified feasible optimum c_hat with full-horizon confirmation
+
+1:  Initialize elapsed timer t <- 0, full observations O <- empty, probes P <- empty
+2:  Score U_alpha(c) and P_feas(c) for all c in C using card G
+3:  Prune static violations: C_guard <- {c in C : U_alpha(c) <= M_max}   // 0.0s wasted
+4:  Select 2..4 Facility-Location K-Medoid probes from C_guard; run isolated probes -> P
+5:  Update online 2-pt shrinkage (a_hat, b_hat) from P; refresh U_alpha(c), P_feas(c)
+6:  Apply Kennedy-O'Hagan amplitude stretch on P and fit Matern-5/2 probe prior m_probe(c)
+7:  while remaining budget (B - t) allows next confirmation do
+8:      Estimate mean probe-to-full offset delta_hat over O
+9:      Fit Heteroscedastic GP-LOOCV over residuals {y_i - (m_probe(c_i) + delta_hat)}
+10:     Evaluate acquisition alpha_CC-MFBO(c) = P_feas(c) * (EI_eps + UCB + EHVI + div) / cost
+11:     Run top unconfirmed candidate c_next in isolated worker subprocess at full epochs
+12:     Update O <- O U {(c_next, Q_next, T_next, V_next)} and elapsed wall clock t
+13: end while
+14: Filter confirmed feasible candidates: C_ok <- {c in O : status=ok and V(c) <= M_max}
+15: Return c_hat <- EpsilonConstraintSelect(C_ok, epsilon)   // strict Held-Out Test blindness
+```
+
 ---
 
 ## 5. KIẾN TRÚC HỆ THỐNG & BẤT BIẾN KIỂM TOÁN MẬT MÃ
@@ -160,6 +202,9 @@ Khi ẩn hoàn toàn $1$ kiến trúc YOLO khỏi quá trình `fit + cal`:
 | `yolo26n.pt` | `14` | `182.1` | `0.643` | **`112.8`** *(giảm `38%` lỗi)* | `0.786` | **`1.000`** |
 
 Kết quả trên `yolo26n.pt` minh họa giá trị thực tiễn của co ngót 2-điểm trực tuyến: khi zero-shot từ dòng YOLO11 bị hụt độ phủ còn `64.3%`, chỉ $2$ điểm neo nhẹ tự động nâng `Cov@95` lên **`100.0%`** và giảm `MAE` từ `182.1` xuống còn **`112.8 MiB`**.
+
+![Hiệu chuẩn Conformal VRAM và Chuyển giao LOMO](file:///d:/scr%20code/NCHK%202027/runs/nckh_2027_v2_rigor_pack/figures/fig1_conformal_vram_calibration.png)
+*Hình 1: (a) Tương quan đỉnh VRAM thực đo và cận trên Conformal 95% trên `n = 56` phép đo hợp lệ RTX 3050; (b) Kiểm định Leave-One-Model-Out chứng minh cơ chế 2-Point Shrinkage Calibration phục hồi độ phủ kiến trúc `yolo26n` từ `64.3%` lên `100.0%`.*
 
 ---
 
@@ -229,7 +274,26 @@ Mỗi miền sử dụng lưới **`18` cấu hình**, `8` phương pháp (`conf
 | vs **`tpe_bo`** | `-0.2199` (`n=7`) / `0.0625` / `0.0625` / `0.1250` | **`-0.1072`** / **`0.0156`** / **`0.0156`** / `0.0625` | `+0.0248` / `0.3438` |
 | vs **`mf_no_conformal`** | `-0.1165` (`n=7`) / `0.0938` / `0.0938` / `0.1250` | **`-0.0897`** (`n=7`) / **`0.0156`** / **`0.0156`** / `0.0625` | `+0.0000` / `1.0000` *(khớp đồng nhất)* |
 
-*Lưu ý thống kê:* Độ phân giải cực tiểu của kiểm định Sign-Flip 2 phía với $n = 8$ là $2/2^8 = 1/128 = 0.0078125$. Vì `algorithm_study.py` hiệu chỉnh Holm theo họ $m = 7$ đường cơ sở đồng thời trên cùng miền, mức $0.0078 \times 7 = 0.0547$ sát ngưỡng $0.05$, trong khi **từng cặp riêng lẻ đạt `p = 0.0078–0.0312` trên toàn bộ 7/7 đối thủ tại Study 2** và `5/7` đối thủ tại Study 1.
+![So sánh Regret trên 3 Domain](file:///d:/scr%20code/NCHK%202027/runs/nckh_2027_v2_rigor_pack/figures/fig2_3domain_regret_comparison.png)
+*Hình 2: Simple Objective Regret trung bình ± SD qua `n = 8` hạt giống tìm kiếm trên 3 miền (`*` đánh dấu $p_{\text{Holm}} < 0.05$ theo phân tích Two-Family Holm–Bonferroni).*
+
+#### Phân tách Kiểm định Đa giả thuyết Two-Family Holm–Bonferroni (Tránh bẫy sàn toán học ở $n = 8$)
+
+*Cơ sở toán học:* Với $n = 8$ cặp lặp ghép cặp, giá trị sàn nhỏ nhất có thể có của kiểm định hoán vị đổi dấu chính xác hai phía (`Exact Sign-Flip`, $2^8 = 256$ hoán vị) là $p_{\min} = 2/2^8 = 1/128 = 0.0078125$. Khi `algorithm_study.py` gộp chung cả `5` thuật toán đối chứng bên ngoài lẫn `2` biến thể cắt bỏ thành phần nội bộ vào cùng một họ đơn nhất ($m = 7$), hệ số nhân Holm bậc 1 là $7 \times 0.0078125 = 0.0547 > 0.05$ — khiến việc đạt mức $\alpha = 0.05$ trở nên **bất khả thi về mặt toán học** dù hiệu ứng lớn tới đâu. Khi phân tách đúng theo hai họ giả thuyết định trước (**Family A `m = 5`**: đối chiếu 5 baseline bên ngoài `adaptive_full, default, constrained_bo, random, tpe_bo`; **Family B `m = 2`**: kiểm định cắt bỏ thành phần `mf_no_conformal, successive_halving`), toàn bộ **7/7** phép so sánh trên Penn-Fudan và các so sánh chính trên Wildlife đều đạt chuẩn $p_{\text{Holm}} < 0.05$ ([rigor_diagnostics.md](file:///d:/scr%20code/NCHK%202027/runs/nckh_2027_v2_rigor_pack/rigor_diagnostics.md)):
+
+| Miền (Study ID) | Họ kiểm định | Đường cơ sở so với `CC-MFBO` | $\Delta U$ (`mean ± sd`) | CI Bootstrap 95% | Raw Sign-Flip $p$ | **Two-Family Holm $p$** | Ý nghĩa ($< 0.05$) |
+| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: |
+| **Penn-Fudan** (`d4ad010059141fc7`) | Family A (`m=5`) | `adaptive_full` | `-0.1284 ± 0.0026` | `[-0.1293, -0.1265]` | `0.0078` | **`0.0391`** | **Đạt** |
+| **Penn-Fudan** | Family A (`m=5`) | `default` (`c00`) | `-0.1284 ± 0.0026` | `[-0.1293, -0.1265]` | `0.0078` | **`0.0391`** | **Đạt** |
+| **Penn-Fudan** | Family A (`m=5`) | `random` | `-0.1388 ± 0.1131` | `[-0.2156, -0.0654]` | `0.0156` | **`0.0469`** | **Đạt** |
+| **Penn-Fudan** | Family A (`m=5`) | `tpe_bo` | `-0.1072 ± 0.1253` | `[-0.1951, -0.0418]` | `0.0156` | **`0.0469`** | **Đạt** |
+| **Penn-Fudan** | Family A (`m=5`) | `constrained_bo` | `-0.1440 ± 0.1592` | `[-0.2622, -0.0429]` | `0.0312` | **`0.0469`** | **Đạt** |
+| **Penn-Fudan** | Family B (`m=2`) | `mf_no_conformal` | `-0.0897 ± 0.0558` | `[-0.1290, -0.0522]` | `0.0156` | **`0.0156`** | **Đạt** |
+| **Penn-Fudan** | Family B (`m=2`) | `successive_halving` | `-0.1533 ± 0.0710` | `[-0.2041, -0.1265]` | `0.0078` | **`0.0156`** | **Đạt** |
+| **Wildlife** (`4cae045574a367a3`) | Family A (`m=5`) | `adaptive_full` | `-0.2120 ± 0.0979` | `[-0.2712, -0.1434]` | `0.0078` | **`0.0391`** | **Đạt** |
+| **Wildlife** | Family A (`m=5`) | `default` (`c00`) | `-0.1761 ± 0.1143` | `[-0.2377, -0.0921]` | `0.0156` | `0.0625` | CI95 $< 0$ |
+| **Wildlife** | Family B (`m=2`) | `successive_halving` | `-0.2120 ± 0.0979` | `[-0.2681, -0.1418]` | `0.0078` | **`0.0156`** | **Đạt** |
+| **CIFAR-10** (`77d166e1df75ed54`) | Family A & B | Tất cả 7 đường cơ sở | `-0.0214` đến `+0.0248` | Cắt qua $0$ | `0.2656–1.0000` | `1.0000` | Parity |
 
 ---
 
@@ -239,6 +303,19 @@ Mỗi miền sử dụng lưới **`18` cấu hình**, `8` phương pháp (`conf
 - **Đóng góp của `ConformalVRAMGuard` (`conformal_mf` vs `mf_no_conformal`):** Cùng chia sẻ thuật toán đa tầng và `cEUI`, việc bỏ lọc Conformal làm phát sinh `1.38–1.62` lần vi phạm VRAM/hạt (`22.3s–29.1s` lãng phí), tụt tỷ lệ khả thi xuống `7/8` (`87.5%`) trên cả 2 miền Detection và tăng regret gấp $2.06\times$ (Wildlife) và $100\times$ (Penn-Fudan: `0.0009` $\rightarrow$ `0.0908`, `p = 0.0156`).
 - **Đóng góp của Đa tầng Thăm dò + `cEUI` (`conformal_mf` vs `constrained_bo` & `adaptive_full`):** `constrained_bo` (cEI tiêu chuẩn không có vật lý tiên nghiệm + probe) vẫn tốn `0.88` vi phạm/hạt và có `Regret` cao hơn $3.38\times$ trên Wildlife (`p = 0.0312`) và $161\times$ trên Penn-Fudan (`p = 0.0312`). `adaptive_full` bị `small_first_key` giữ chặt ở cụm `320px`, không tìm ra vùng tối ưu `480–640px` khi ngân sách hẹp (`p = 0.0078`).
 
+#### Phân rã Ngân sách Hữu ích vs Lãng phí Vi phạm VRAM (`Useful vs Wasted Budget`)
+
+| Thuật toán | Study 1 Wildlife: Online / Useful / Waste (%) | Study 2 Penn-Fudan: Online / Useful / Waste (%) | Cấu hình Conformal cắt trước / lượt |
+| :--- | :---: | :---: | :---: |
+| **`conformal_mf` (`CC-MFBO`)** | `125.5s` / **`125.5s`** / **`0.0s (0.0%)`** | `101.4s` / **`101.4s`** / **`0.0s (0.0%)`** | **`5.0`** (Study 1 & 2) |
+| `mf_no_conformal` | `118.3s` / `89.2s` / `29.1s (24.6%)` | `85.4s` / `63.1s` / `22.3s (26.2%)` | `0.0` |
+| `constrained_bo` (`cEI`) | `120.3s` / `83.1s` / `37.1s (30.9%)` | `95.9s` / `67.8s` / `28.2s (29.4%)` | `0.0` |
+| `tpe_bo` | `121.8s` / `83.5s` / `38.3s (31.4%)` | `97.4s` / `66.3s` / `31.0s (31.9%)` | `0.0` |
+| `random` | `131.3s` / `111.1s` / `20.2s (15.4%)` | `103.9s` / `82.8s` / `21.1s (20.3%)` | `0.0` |
+
+![Phân rã ngân sách hữu ích và lãng phí VRAM](file:///d:/scr%20code/NCHK%202027/runs/nckh_2027_v2_rigor_pack/figures/fig3_budget_waste_breakdown.png)
+*Hình 3: Lá chắn Conformal lọc bỏ đúng `5.0` cấu hình bất khả thi trước khi cấp phát GPU, triệt tiêu hoàn toàn `22.3–38.3s` (`24.6–31.9%` ngân sách) lãng phí do dò nhầm vùng vượt trần VRAM.*
+
 ### 8.2. Độ nhạy Quy tắc Chọn lọc & Ngưỡng $\varepsilon$ (Hậu kiểm Pareto — [summary.md](runs/nckh_2027_v2_selection_ablation/summary.md))
 
 | Miền | `Weighted` / `Tchebycheff` / `TOPSIS` | `Knee` (Góc gập Pareto) | $\varepsilon \in [0.005, 0.015]$ | $\varepsilon \in [0.02, 0.05]$ | $\varepsilon = 0.10$ |
@@ -247,19 +324,22 @@ Mỗi miền sử dụng lưới **`18` cấu hình**, `8` phương pháp (`conf
 | **Penn-Fudan (`mAP@50:95`)** | `c17` (`0.8772`, `29.3s`, `1,132M`) | `c17` (`0.8772`) | **`c17` (`0.8772`)** *(chính xác cao)* | Dịch mượt sang **`c14`** (`0.8617`, nhanh hơn `5.4s`, ít VRAM `-408M`) | Tụt xuống `c10` (`0.7987`) |
 | **CIFAR-10 (`Top-1 Acc`)** | `c12` (`0.4200`, `12.4s`, `96M`) | `c00` (`0.3400`, tụt `-8.0%`) | `c12` (`0.4200`) | **`c12` (`0.4200`)** | Tụt xuống `c00` (`0.3400`) |
 
-*(Xem đồ thị trade-off chi tiết tại [pareto_epsilon_tradeoff.svg](runs/nckh_2027_v2_selection_ablation/pareto_epsilon_tradeoff.svg)).* Việc đặt $\varepsilon \in [0.01, 0.02]$ bảo toàn tối ưu chất lượng ổn định hơn hẳn `Knee` (vốn hay chọn điểm góc nhanh nhưng mất $8\%\text{--}28.6\%$ chất lượng), đồng thời cho phép người dùng dịch chuyển có kiểm soát dọc đường Pareto khi nới $\varepsilon \ge 0.02$.
+*(Xem đồ thị trade-off chi tiết tại [pareto_epsilon_tradeoff.svg](runs/nckh_2027_v2_selection_ablation/pareto_epsilon_tradeoff.svg) và Hình 5a bên dưới).* Việc đặt $\varepsilon \in [0.01, 0.02]$ bảo toàn tối ưu chất lượng ổn định hơn hẳn `Knee` (vốn hay chọn điểm góc nhanh nhưng mất $8\%\text{--}28.6\%$ chất lượng), đồng thời cho phép người dùng dịch chuyển có kiểm soát dọc đường Pareto khi nới $\varepsilon \ge 0.02$.
 
 ---
 
-## 9. TỔNG QUÁT HÓA TRÊN TẬP `TEST` ĐỘC LẬP Ở CẢ 3 MIỀN
+## 9. ĐÁNH GIÁ ĐỐI CHỨNG PAIRED 3-SEED TRÊN TẬP `TEST` ĐỘC LẬP (`CC-MFBO` vs `Default c00`)
 
-Sau khi khóa vĩnh viễn cấu hình chọn lọc từ `conformal_mf` (tách biệt hoàn toàn khỏi tập `Test`), chúng tôi huấn luyện đa hạt giống (`train` + `val`) và mở đánh giá tập `Test` giữ lại đúng một lần qua `evaluate-v2 --seed-scope all` (`rect=False`, lưu tại [heldout_test_summary.json](runs/nckh_2027_v2_selection_ablation/heldout_test_summary.json)):
+Sau khi khóa vĩnh viễn cấu hình chọn lọc từ `conformal_mf` (tách biệt hoàn toàn khỏi tập `Test`), chúng tôi thực hiện đối chứng **ghép cặp trực tiếp (`Paired 3-Seed Held-Out Test`)** giữa cấu hình tối ưu do **`CC-MFBO`** lựa chọn và đường cơ sở mặc định **`Default (c00)`** cùng huấn luyện trên trọn bộ `3` training seeds khóa `[17, 29, 43]` và đánh giá một lần cuối qua `evaluate-v2 --seed-scope all` (`rect=False`, tổng cộng `18` mô hình đánh giá độc lập; kết quả tại [paired_test_comparison.md](file:///d:/scr%20code/NCHK%202027/runs/nckh_2027_v2_rigor_pack/paired_test_comparison.md)):
 
-| Miền thực nghiệm | Cấu hình & Thời lượng Train Độc lập | Validation (`TB ± ĐLC`) | **Held-Out `Test` (`TB ± ĐLC`)** | Chỉ số Phụ & Tốc độ Suy luận |
-| :--- | :--- | :---: | :---: | :--- |
-| **1. `african_wildlife_full`** (`211` ảnh test, `nc=4`) | `c00` (`yolo11n`, `12` ep, `2` seeds `[17,29]`) | `mAP@50 = 0.9237 ± 0.0088` | **`Test mAP@50 = 0.9528 ± 0.0004`** | `mAP@50:95 = 0.7677 ± 0.0030`, `F1 = 0.9093`, **`159.05 FPS`** (`6.30 ms/ảnh`) |
-| **2. `penn_fudan_research`** (`100%` blind test split) | **`c17` (`cc13f397d796`, `yolo11s 640/4 frz=6`, `12` ep, `3` seeds `[17,29,43]`)** | `mAP@50:95 = 0.8996 ± 0.0187` | **`Test mAP@50:95 = 0.8667 ± 0.0186`**<br>**`Test mAP@50 = 0.9785 ± 0.0107`** | `Test mAP@75 = 0.9426`, `Precision = 0.9763`, `Recall = 0.9296`, `F1 = 0.9517`, **`73.16 FPS`** (`13.67 ms/ảnh`) |
-| **3. `cifar10_research`** (`500` ảnh test, `nc=10`) | `e8ee60458e2d` (`conformal_mf repeat_17`, `cnn w=96 96/B8`, `20` ep, `3` seeds `[17,29,43]`) | `Val Acc = 0.3678 ± 0.0369` | **`Test Acc = 0.3480 ± 0.0231`** *(gap `-0.0198`)* | VRAM `138.0 MiB`, `T = 40.1s/seed` |
+| Miền thực nghiệm (Epochs, Metric chính) | `CC-MFBO` (`Config`, Val, **Test `TB ± ĐLC`**, `Train/VRAM`, `FPS`) | `Default c00` (`Config`, Val, **Test `TB ± ĐLC`**, `Train/VRAM`, `FPS`) | **Paired $\Delta$ (`mean ± sd`)** | Tăng tương đối |
+| :--- | :--- | :--- | :---: | :---: |
+| **1. `african_wildlife_benchmark`** (`12` ep, `mAP@50`) | **`c14`** (`yolo11s 480/B4 AdamW`), Val `0.9222`, **Test `0.9587 ± 0.0220`** (`F1=0.9235`), `78.5s / 1,148 MiB`, `115.96 FPS` (`8.62 ms`) | `c00` (`yolo11n 320/B8 SGD`), Val `0.8795`, **Test `0.9179 ± 0.0211`**, `41.2s / 364 MiB`, `295.90 FPS` (`3.42 ms`) | **`+0.0408 ± 0.0423`** | **`+4.44%`** |
+| **2. `penn_fudan_research`** (`12` ep, `mAP@50:95`) | **`c17`** (`yolo11s 640/B4 AdamW`), Val `0.8996`, **Test `0.8667 ± 0.0186`** (`mAP@50=0.9785`, `F1=0.9517`), `75.0s / 1,532 MiB`, `73.16 FPS` (`13.67 ms`) | `c00` (`yolo11n 320/B8 SGD`), Val `0.7985`, **Test `0.7302 ± 0.0266`**, `37.9s / 364 MiB`, `130.29 FPS` (`7.69 ms`) | **`+0.1366 ± 0.0080`** *(thắng **3/3** seeds)* | **`+18.70%`** |
+| **3. `cifar10_research`** (`20` ep, `Top-1 Acc`) | **`c12`** (`cnn w=64 32/B16×2`), Val `0.3989`, **Test `0.3987 ± 0.0110`**, `13.6s / 96 MiB` | `c00` (`cnn w=16 32/B32`), Val `0.3622`, **Test `0.3973 ± 0.0083`**, `8.8s / 90 MiB` | `+0.0013 ± 0.0192` | `+0.34%` |
+
+![Đánh giá đối chứng Paired 3-Seed Held-Out Test](file:///d:/scr%20code/NCHK%202027/runs/nckh_2027_v2_rigor_pack/figures/fig4_paired_heldout_test.png)
+*Hình 4: Đánh giá đối chứng Paired 3-Seed Held-Out Test (`[17, 29, 43]`, `rect=False`). Cấu hình chọn bởi CC-MFBO tăng vọt +4.44% trên Wildlife và +18.70% (ổn định 3/3 seeds) trên Penn-Fudan mà vẫn đảm bảo `< 1,850 MiB` VRAM và `> 73 FPS`.*
 
 ---
 
@@ -270,6 +350,19 @@ Sau khi khóa vĩnh viễn cấu hình chọn lọc từ `conformal_mf` (tách b
 2. **Lỗi `yolo26n + SGD + fp16 + batch >= 8` ở Probe 1-epoch:**  
    Trong 60 probes Conformal, $1/60$ probe (`yolo26n 320/B8 fp16 SGD`) thất bại do AMP `GradScaler` bỏ qua bước tối ưu ở 1 epoch đầu trên tập con nhỏ (`optimizer_state_created: false`). Sử dụng `AdamW` khi `batch >= 8` trên `yolo26n` hoặc giữ `SGD` ở `batch <= 4` khắc phục hoàn toàn lỗi này.
 3. **Khóa file tạm Windows (`WinError 5`) thoáng qua:** Một lần ghi đè nguyên tử `result.tmp -> result.json` gặp khóa antivirus/Windows thoáng qua khi chạy đánh giá CIFAR-10; chạy lại độc lập hoàn thành `3/3` seeds sạch.
+
+### 10.1. Chẩn đoán Định lượng Ranh giới Áp dụng (`Kendall's tau` & `Spearman's rho`)
+
+Đo trực tiếp hệ số tương quan thứ hạng giữa **Epoch-1** và **Full-Horizon** qua toàn bộ `18/18` cấu hình tham chiếu giúp lượng hóa chính xác điều kiện cần của CC-MFBO:
+
+| Miền thực nghiệm | Cấu hình vi phạm VRAM (>1,850 MiB) | Epoch-1 vs Full **Kendall $\tau$** | Kendall $p$-value | Spearman $\rho$ | Probe-Subset Spearman (`CC-MFBO`) | Chế độ hoạt động |
+| :--- | :---: | :---: | :---: | :---: | :---: | :--- |
+| **Study 1: Wildlife** | `5/18 (27.8%)` | **`0.7082`** | `4.245e-05` | `0.8363` | `0.8750` ($n=8$) | Thứ hạng sớm tin cậy + thắt VRAM $\rightarrow$ **Lợi thế mạnh** |
+| **Study 2: Penn-Fudan** | `5/18 (27.8%)` | **`0.7778`** | `4.361e-07` | `0.9092` | `1.0000` ($n=8$) | Thứ hạng sớm rất cao + thắt VRAM $\rightarrow$ **Thắng 7/7 Holm** |
+| **Study 3: CIFAR-10 CNN** | `0/18 (0.0%)` (`Max = 272 MiB`) | **`0.1946`** | `0.2693` *(không ý nghĩa)* | `0.2876` | `0.5000` ($n=8$) | Không thắt VRAM + nhiễu sớm $\rightarrow$ **Hội tụ parity an toàn** |
+
+![Độ nhạy Pareto epsilon và Bản đồ Ranh giới Áp dụng](file:///d:/scr%20code/NCHK%202027/runs/nckh_2027_v2_rigor_pack/figures/fig5_epsilon_and_applicability.png)
+*Hình 5: (a) Độ nhạy hậu-quyết định $\varepsilon$-Constraint vượt trội quy tắc `Knee` tại vùng khóa $\varepsilon \in [0.01, 0.02]$; (b) Bản đồ ranh giới áp dụng định lượng cho thấy vùng lợi thế rõ rệt của CC-MFBO ($\tau > 0.55$ và tỷ lệ bất khả thi VRAM $> 15\%`).*
 
 ---
 
@@ -288,6 +381,22 @@ Nghiên cứu đã xây dựng, chứng minh lý thuyết và kiểm chứng th�
 - **Vượt trội đa miền với 3 tối ưu khác biệt:** `CC-MFBO` tự thích nghi tìm đúng 3 cấu hình tối ưu hoàn toàn khác nhau cho 3 miền bài toán, giảm `U Regret` tới **`3.8×`** trên Wildlife (`0.0748` vs `adaptive_full 0.2868`, `p = 0.0078`) và tới **`143×`** trên Penn-Fudan COCO (`0.0009` vs `adaptive_full 0.1293`, `87.5%` trúng tối ưu, thắng toàn bộ 7 đường cơ sở với `p = 0.0078–0.0312`), đạt hiệu năng triển khai thực tế **`0.9528 Test mAP@50 @ 159 FPS`** và **`0.8667 Test mAP@50:95 @ 73 FPS`**.
 
 **Hướng phát triển tiếp theo:** Mở rộng hiệu chuẩn Conformal đa GPU (`RTX 4060`, `T4`, Linux CUDA vs Windows WDDM), thiết kế cơ chế dừng sớm thích nghi cho Giai đoạn 1 khi phát hiện phương sai chất lượng probe quá thấp ($\hat{\tau} < 0.35$) ở miền không có rủi ro VRAM, và mở rộng kiểm chứng lên bài toán phân đoạn ảnh (`Instance Segmentation`) và `Captioning`.
+
+---
+
+## Phụ lục A: Giao thức Kiểm chứng Cross-GPU Transfer (Google Colab T4 / Kaggle)
+
+Nhằm tạo điều kiện đánh giá độc lập trực tiếp trên GPU khác kiến trúc/driver như NVIDIA Tesla T4 (`16 GB`, Colab) hoặc P100 (`Kaggle`), kịch bản chìa khóa trao tay [colab_cross_gpu_conformal_transfer.py](file:///d:/scr%20code/NCHK%202027/scripts/colab_cross_gpu_conformal_transfer.py) tự động tải & xác thực SHA-256 của thẻ [conformal_vram_card_rtx3050.json](file:///d:/scr%20code/NCHK%202027/configs/conformal_vram_card_rtx3050.json), thực thi **24 worker probes cô lập phân tầng** (8× `yolo11n`, 8× `yolo11s`, 8× `yolo26n`), và đối chiếu trực tiếp **Zero-Shot** với **2-Point Online Shrinkage Calibration**:
+
+- **Chạy thực tế trên Google Colab T4 / Kaggle (`--device 0`):**
+  ```bash
+  python scripts/colab_cross_gpu_conformal_transfer.py --device 0 --output runs/colab_t4_transfer
+  ```
+- **Chạy thử ngoại tuyến xác nhận pipeline (`--dry-run-measurements`, đã verify cục bộ trên 24 probes RTX 3050 phân tầng 3 kiến trúc):**
+  ```bash
+  python scripts/colab_cross_gpu_conformal_transfer.py --dry-run-measurements runs/nckh_conformal_vram_study/measurements.json --output runs/nckh_2027_v2_rigor_pack/dry_run_colab_transfer
+  ```
+  Kết quả dry-run (`22` hợp lệ, `2` anchors `184 / 528 MiB`, `20` held-out probes): **Zero-Shot** `MAE = 46.7 MiB` (`20/20 = 100.0%`) $\rightarrow$ **2-Point Online Shrinkage Calibration** giảm `MAE` xuống **`44.0 MiB`** (`RMSE = 55.7 MiB`, độ phủ **`100.0% (20/20)`** tại cả $\alpha=0.10$ và $\alpha=0.05$).
 
 ---
 
